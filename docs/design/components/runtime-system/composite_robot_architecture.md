@@ -1,534 +1,588 @@
-# Composite Robot Architecture
+# Agentic Autonomy Layer
 
-This document defines the **multi-system autonomy architecture** for composite robots — humanoids, mobile manipulators, and any robot that runs more than one decision-making subsystem concurrently (VLA + locomotion + perception + world model + planner + …).
+This document defines the **agentic autonomy layer** for PhysicalAI: the deliberative
+system that turns a language goal into grounded robot behavior by planning, imagining
+outcomes in a world model, verifying, and dispatching skills to the reactive runtime.
 
-It builds on the production single-rate runtime defined in [`robot_runtime_architecture.md`](./robot_runtime_architecture.md) (Doc A). It does not replace it. Composite autonomy is **one `Controller` implementation** — `AutonomyController` — that runs inside `RobotRuntime` and returns one `RobotAction` per tick. Everything below describes what lives inside that controller.
+It builds on the production single-rate runtime in
+[`robot_runtime_architecture.md`](./robot_runtime_architecture.md) (Doc A). It does **not**
+replace it. The whole autonomy stack still executes through **one `RobotRuntime` loop**;
+this document defines the layer that sits *above* it and decides *what that loop should be
+doing right now*.
 
-This is intentionally future-facing. No code in this document should be implemented before a concrete composite robot integration (e.g., a Unitree G1) is in scope. The purpose of writing it now is to ensure Doc A's contracts (`Controller`, `Robot`, `RobotAction`, `Observation`) do not paint us into a corner when composite autonomy lands.
+It is intentionally future-facing. No code here should be implemented before a concrete
+agentic integration (e.g. a Qwen-RobotSuite-style planner + VLA + world model, or a Unitree
+G1 humanoid) is in scope. The purpose of writing it now is to ensure Doc A's contracts
+(`Controller`, `Robot`, `RobotAction`, `Observation`) extend cleanly to full autonomy
+without rework.
 
 ---
 
-## 1. Scope And Non-Goals
+## Quick Navigation
+
+- [1. The Dual-Process Architecture](#1-the-dual-process-architecture)
+- [2. Scope and Non-Goals](#2-scope-and-non-goals)
+- [3. Environment: One Substrate for Real, Sim, and World Model](#3-environment-one-substrate-for-real-sim-and-world-model)
+- [4. Goal and Skill: The Seam Between the Loops](#4-goal-and-skill-the-seam-between-the-loops)
+- [5. The Agent Loop](#5-the-agent-loop)
+- [6. Worked Example: A Qwen-RobotSuite-Style Pipeline](#6-worked-example-a-qwen-robotsuite-style-pipeline)
+- [7. CompositeController: Multi-Rate Effector Arbitration](#7-compositecontroller-multi-rate-effector-arbitration)
+- [8. Execution and Scaling](#8-execution-and-scaling)
+- [9. Safety Across Layers](#9-safety-across-layers)
+- [10. Prior Art](#10-prior-art)
+- [11. What This Doc Does NOT Define](#11-what-this-doc-does-not-define)
+- [12. Decision Summary](#12-decision-summary)
+
+---
+
+## 1. The Dual-Process Architecture
+
+Modern robot autonomy is a **two-loop hierarchy**. A slow deliberative process reasons about
+goals; a fast reactive process controls the hardware. This is the "System 2 / System 1"
+split used by hierarchical VLA stacks, and it is the same shape as the classic three-layer
+(deliberator / sequencer / controller) robotics architectures.
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│  AGENT   —  System 2  ·  deliberative  ·  ~0.1–1 Hz  ·  async          │
+│                                                                        │
+│    perceive → plan (LLM/VLM) → imagine (WorldModel) → verify           │
+│            → commit Goal → dispatch Skill → monitor → replan           │
+│                                                                        │
+│    reads:  WorldView (fused state)                                     │
+│    uses:   WorldModel.rollout()  for counterfactual verification       │
+│    emits:  Goal, and the Skill that pursues it                         │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                 │  Goal / Skill
+                                 │  (long-running, with status + feedback)
+                                 ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  RobotRuntime   —  System 1  ·  reactive  ·  fixed FPS  ·  sync        │
+│                                                                        │
+│    runs the ACTIVE Controller that the current Skill installed         │
+│    observation → controller.update() → safety → send_action            │
+│                                                                        │
+│    Doc A. UNCHANGED.                                                    │
+└───────────────────────────────┬──────────────────────────────────────┘
+                                 ▼
+        Environment (Robot │ Sim)            WorldModel (predictive only)
+```
+
+The single most important design decision:
+
+```text
+A Skill is realized as a Controller.
+The Agent executes a Skill by calling RobotRuntime.swap_controller().
+```
+
+There is still exactly one outer loop. The Agent never touches hardware and never runs a
+second control loop. It selects *which* `Controller` the one `RobotRuntime` should run next.
+Everything Doc A already provides — fixed-rate timing, callbacks, recording, telemetry,
+safety, error recovery — applies unchanged to fully autonomous behavior.
+
+### Why the seam matters
+
+The gap in a pure reactive design (e.g. a blackboard with per-tick arbitration) is that it
+has no vocabulary for **long-running, goal-directed work with feedback**: "navigate to the
+umbrella", "pick the mug", "if the grasp fails, retry from a new approach". That is the
+`Goal` / `Skill` contract (§4). It is the robotics equivalent of a long-running action
+(propose → executing → succeeded / failed), and it is what lets a general agent treat robot
+capabilities as **callable tools**.
+
+---
+
+## 2. Scope and Non-Goals
 
 ### Scope
 
-A reusable composition layer for robots whose autonomy combines several systems with different rates, latencies, and responsibilities, such as:
+A reusable deliberative layer for robots whose behavior is driven by a planner or agent that
+composes multiple decision-making systems:
 
-- A **VLA policy** producing arm/hand targets at ~10–30 Hz
-- A **locomotion stack** producing base twists or gait goals at ~100–500 Hz
-- **Perception** producing scene state at ~10–30 Hz
-- A **world model** maintaining occupancy / object memory at ~5–10 Hz
-- A **task planner** selecting goals at ~0.1–1 Hz
+- A **high-level planner / agent** (LLM or VLM) that decomposes language goals into skills.
+- A **world model** used to imagine and rank candidate plans before spending real robot time.
+- One or more **policies** (VLA manipulation, navigation) invoked as skills.
+- Optional **multi-rate subsystems** (locomotion + arms + gaze) composed into a single tick
+  for humanoids and mobile manipulators (§7).
 
 The layer must:
 
-1. Run each subsystem at its own rate without blocking the control tick.
-2. Share state between subsystems through a **typed, timestamped blackboard**, not direct calls.
-3. Produce one coherent `RobotAction` per `RobotRuntime` tick by **arbitrating effector-scoped commands** from action-producing subsystems.
-4. Degrade safely when a subsystem is slow, unhealthy, or absent.
-5. Stay framework-light: no mandatory ROS 2, no mandatory behavior-tree dependency, no GXF runtime.
+1. Turn a `Goal` into robot behavior through skills executed by `RobotRuntime`.
+2. Verify plans against a `WorldModel` without touching hardware.
+3. Run planning off the control thread; never stall the reactive tick.
+4. Monitor skill execution and replan on failure.
+5. Treat real robot, simulator, and world model as the **same `Observation` / `Action`
+   substrate** with different capabilities.
+6. Stay framework-light: no mandatory ROS 2, no mandatory behavior-tree dependency.
 
 ### Non-Goals
 
-- Replacing low-level control (joint servoing, gait MPC, balance). Those live in the `Robot` driver or the vendor stack.
-- Replacing `RobotRuntime`. The outer loop, lifecycle, callbacks, safety, and dispatch stay in Doc A.
-- Defining the policy/inference plumbing. That is `PolicyController` + `InferenceExecution` from Doc A §5.
-- Becoming a general distributed actor framework. Multi-process / multi-host orchestration is a possible future extension; the initial layer is single-process.
-- Replacing ROS 2 where ROS 2 already exists. ROS 2 is an integration target, not a competitor.
-- Defining a typed `RobotAction` class hierarchy. Use the namespaced mapping form from [`../robot-interface.md`](../robot-interface.md#action-evolution-from-npndarray-to-namespaced-mappings).
+- Replacing `RobotRuntime`. The outer loop, lifecycle, callbacks, safety, and dispatch stay
+  in Doc A.
+- Replacing low-level control (joint servoing, gait MPC, balance). Those live in the `Robot`
+  driver or vendor stack.
+- Defining the inference plumbing. That is `PolicyController` + `InferenceExecution`
+  (Doc A §5). Skills reuse it.
+- Becoming a distributed actor framework. The initial layer is single-process with
+  per-subsystem worker escape hatches (§8).
+- Training the planner, world model, or policies. This is a runtime/serving layer.
 
 ---
 
-## 2. Why Separate From Doc A
+## 3. Environment: One Substrate for Real, Sim, and World Model
 
-Three reasons composite autonomy does **not** belong inside `robot_runtime_architecture.md`:
-
-1. **Different cadence.** Doc A is one rate; composite is many.
-2. **Different contracts.** Doc A's `Controller` is `Observation -> RobotAction`. Composite needs subsystem lifecycle, blackboard semantics, freshness, and arbitration — none of which the policy/teleop/HIL/DAgger workflows need.
-3. **Different shipping order.** Doc A ships now and powers the existing Studio worker. Doc B ships when there is a real composite robot to drive. Mixing them would force composite concepts into every reader of the production design.
-
-The boundary between the two docs:
-
-```text
-Doc A:
-  RobotRuntime  ->  Controller  ->  RobotAction  ->  Robot
-
-Doc B:
-  AutonomyController implements Controller
-  AutonomyController owns:
-    subsystem scheduler
-    blackboard
-    arbitration
-    perception / world / planner / VLA / locomotion subsystems
-```
-
-`RobotRuntime` does not change.
-
----
-
-## 3. Prior-Art Survey
-
-A comparison of systems we considered borrowing from. Each row identifies what to **steal** and what to **avoid**.
-
-| System                              | Steal                                                                                           | Avoid                                                                       |
-| ----------------------------------- | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| **ROS 2 / rclpy**                   | lifecycle states, pub/sub mental model, QoS / deadline / liveliness thinking, actions/services for long-running goals, TF-style frame naming, timestamped messages | mandatory `rclpy` dependency, leaking ROS message types into PhysicalAI core, executor complexity for simple robots |
-| **NVIDIA Isaac GXF**                | explicit graph of components, scheduler abstraction, timestamped tensors                        | NVIDIA-specific heavy runtime, tight coupling to Isaac SDK                  |
-| **MuJoCo MJX dataflow**             | clean state/action arrays, sim batchability, normalization discipline                           | using a sim dataflow as a real-robot runtime                                |
-| **Behavior trees (py_trees, BehaviorTree.CPP)** | tick/status model, blackboard pattern, task-level arbitration                       | forcing every subsystem to be a BT node                                     |
-| **LeRobot**                         | simple robot/policy/dataset ergonomics, naming                                                  | using it as an autonomy architecture (it isn't one)                         |
-| **Boston Dynamics SDK patterns**    | leases (single writer), e-stop, command feedback, time sync, command authority                  | proprietary robot-specific assumptions                                      |
-| **Open Robotics `ros2_control`**    | hardware abstraction vs controller manager separation, controller switching                     | replacing robot drivers or low-level controllers inside PhysicalAI          |
-
-### ROS 2 Verdict
-
-**Use ROS 2 as an optional integration boundary, not the core runtime.**
-
-Why not mandatory ROS 2:
-
-- Simple robots (SO-101) should not need a ROS install.
-- `rclpy` executors add complexity that hurts research notebooks/scripts.
-- PhysicalAI must remain robot-agnostic.
-
-How ROS 2 enters the picture for complex robots: as a **subsystem adapter**.
-
-```text
-ROS2LocomotionSubsystem
-  subscribes to robot state topics
-  publishes velocity / gait commands
-  writes health + state to the Blackboard
-  implements RuntimeSubsystem
-```
-
-The autonomy graph remains PhysicalAI-native; ROS 2 lives at one boundary.
-
----
-
-## 4. AutonomyController Inside RobotRuntime
-
-`AutonomyController` is the only thing `RobotRuntime` sees. It satisfies Doc A's `Controller` protocol:
+A Qwen-RobotSuite-style pipeline runs the same behavior **on hardware or in sim**, and uses a
+**world model as a neural simulator** to rank plans. These are not three unrelated interfaces
+— they are the same `Observation` / `Action` types with different *capabilities*. We model
+this with small structural protocols (matching the existing `Robot` Protocol style), not a
+single god-interface.
 
 ```python
-class AutonomyController:
-    def start(self) -> None: ...
-    def update(self, observation: Observation) -> RobotAction: ...
-    def stop(self) -> None: ...
-    def reset(self) -> None: ...
+class Observable(Protocol):
+    def get_observation(self) -> Observation: ...
+
+class Actuable(Protocol):
+    def send_action(self, action: RobotAction, *, goal_time: float = ...) -> None: ...
+
+class Resettable(Protocol):
+    def reset(self, *, seed: int | None = None) -> Observation: ...
+
+class WorldModel(Protocol):
+    def rollout(
+        self,
+        obs: Observation,
+        actions: Sequence[RobotAction],
+    ) -> PredictedTrajectory: ...
 ```
 
-Inside, it owns:
+Capability composition:
 
-```text
-AutonomyController
-  scheduler         drives subsystems at their own rates
-  blackboard        typed, timestamped cache of subsystem outputs
-  subsystems
-    perception      InfoSubsystem  (scene, detections)
-    world_model     InfoSubsystem  (occupancy, object memory)
-    planner         InfoSubsystem  (intent, goals)
-    vla             ActionSubsystem (arm/hand RobotAction fragments)
-    locomotion      ActionSubsystem (base RobotAction fragments)
-  arbiter           merges action fragments into one RobotAction
-```
+| Substrate         | Observable | Actuable | Resettable | WorldModel | Real-time |
+| ----------------- | :--------: | :------: | :--------: | :--------: | :-------: |
+| `Robot` (Doc A)   |     ✓      |    ✓     |            |            |    yes    |
+| Simulator         |     ✓      |    ✓     |     ✓      |            |    no     |
+| World model       |            |          |            |     ✓      |    no     |
 
-`update(observation)` is fast and non-blocking: it publishes the observation, ticks any subsystems whose schedule fires this loop iteration, reads the latest action fragments from the blackboard, runs the arbiter, and returns one `RobotAction`. Slow subsystems do not stall the tick — the arbiter uses the most recent fresh fragment per effector, or applies the configured degrade behavior.
+The rules that keep this clean:
 
-```text
-RobotRuntime tick:
-  observation = robot.get_observation() + cameras + runtime fields
-  controller.update(observation):
-    blackboard.publish("observation", observation)
-    scheduler.tick(now)                 # may run 0..N subsystems this iteration
-    fragments = blackboard.read_action_fragments()
-    return arbiter.merge(fragments, observation, now)
-  robot.send_action(action)
-```
+- **`RobotRuntime` depends only on `Observable + Actuable`** — exactly today's `Robot`. The
+  reactive loop never sees `Resettable` or `WorldModel`. Sim and world model are consumed by
+  the **Agent**, not the runtime.
+- **`WorldModel.rollout()` is pure and side-effect free.** It takes an initial observation
+  and a candidate action (or skill) sequence and returns a predicted trajectory plus a score.
+  It never actuates anything. This is what makes "imagine before you act" safe to express.
+- `Robot` is unchanged. A simulator is a drop-in `Observable + Actuable + Resettable` and can
+  back the exact same `RobotRuntime` for offline rollout or CI.
+
+`PredictedTrajectory` carries predicted observations, optional per-step scores, and a
+terminal outcome estimate. Because a world model such as Qwen-RobotWorld is a *plausibility
+engine, not a contact-accurate simulator*, the Agent treats rollout scores as a **ranking
+signal for coarse plans**, then verifies the committed plan on hardware or sim (§5).
 
 ---
 
-## 5. RuntimeSubsystem Protocol
+## 4. Goal and Skill: The Seam Between the Loops
 
-Two flavors. Both share lifecycle and health.
+This is the contract the old reactive-only design was missing. It is the robotics analogue of
+a long-running action: a goal is requested, an execution runs, and it eventually succeeds,
+fails, or is aborted — with feedback along the way.
 
-### 5.1 Common lifecycle
+### 4.1 Goal
+
+A `Goal` is a typed, declarative intent with an explicit notion of success.
+
+```python
+@dataclass(frozen=True)
+class Goal:
+    kind: str                      # "navigate_to" | "pick" | "place" | ...
+    params: Mapping[str, Any]      # {"object": "mug"} or {"x": 1.2, "y": 0.3, "heading": 0.0}
+    success: SuccessCriterion      # predicate over WorldView / Observation
+    deadline_s: float | None = None
+    parent: GoalId | None = None   # for hierarchical decomposition
+```
+
+Goals form a tree: the planner decomposes a top-level language goal into child goals, each
+satisfiable by a skill.
+
+### 4.2 Skill
+
+A `Skill` is a reusable capability that pursues one kind of `Goal`. Crucially, **a skill is
+executed by producing a `Controller`** — the same `Controller` protocol `RobotRuntime`
+already runs (Doc A §7).
+
+```python
+class Skill(Protocol):
+    name: str
+    goal_kinds: frozenset[str]                 # which Goal.kind values it handles
+
+    def can_run(self, goal: Goal, world: WorldView) -> bool:
+        """Precondition check against current fused state."""
+
+    def controller(self, goal: Goal) -> Controller:
+        """Return the Controller that RobotRuntime will run to pursue this goal."""
+
+    def status(self) -> SkillStatus:
+        """RUNNING | SUCCEEDED | FAILED | ABORTED — polled by the Agent."""
+
+    def feedback(self) -> Mapping[str, Any]:
+        """Structured progress for the planner (distance-to-goal, grasp confidence, ...)."""
+```
+
+Examples of the `Skill → Controller` mapping:
+
+| Skill            | Goal.kind      | Controller it installs                                     |
+| ---------------- | -------------- | ---------------------------------------------------------- |
+| `NavigateSkill`  | `navigate_to`  | waypoint-tracking `Controller` (consumes nav waypoints)    |
+| `PickSkill`      | `pick`         | `PolicyController(model=manip_vla, execution=...)`         |
+| `PlaceSkill`     | `place`        | `PolicyController(...)` with a place-conditioned prompt    |
+| `TeleopSkill`    | `teleop`       | `TeleopController`                                         |
+| `HumanoidSkill`  | `whole_body`   | `CompositeController` (§7)                                  |
+
+A skill may wrap Doc A's `PolicyController`, `InferenceExecution`, and `ActionQueue` verbatim.
+The agentic layer does **not** reinvent inference plumbing; it schedules it.
+
+### 4.3 Skill lifecycle
+
+```text
+requested ──▶ can_run? ──no──▶ rejected (planner picks another skill)
+                 │yes
+                 ▼
+           controller(goal)
+                 │
+   RobotRuntime.swap_controller(controller)     ◀── the only execution mechanism
+                 │
+              RUNNING ──▶ SUCCEEDED   (success criterion met)
+                 │    ├──▶ FAILED      (unrecoverable; agent replans)
+                 │    └──▶ ABORTED     (agent preempts with a new goal)
+                 ▼
+           feedback() streamed to the planner throughout
+```
+
+### 4.4 SkillRegistry — robot capabilities as callable tools
+
+```python
+class SkillRegistry:
+    def register(self, skill: Skill) -> None: ...
+    def resolve(self, goal: Goal, world: WorldView) -> Skill | None: ...
+    def as_tools(self) -> list[ToolSpec]:
+        """Expose skills as tool schemas for an LLM/VLM agent to call."""
+```
+
+`as_tools()` is what lets a general agent (e.g. a Qwen planner) call `navigate_to`, `pick`,
+and `place` as tools. The registry is the boundary between "the agent's tool vocabulary" and
+"the runtime's executable controllers".
+
+---
+
+## 5. The Agent Loop
+
+The Agent is the deliberative process. It is **not** on a fixed rate and it **never blocks
+the control tick** — it runs in its own thread/process and communicates with `RobotRuntime`
+only through `swap_controller()` and by reading runtime telemetry.
+
+```python
+class Agent:
+    def __init__(
+        self,
+        planner: Planner,              # LLM/VLM: Goal + WorldView -> Plan (skill tree)
+        registry: SkillRegistry,
+        runtime: RobotRuntime,
+        world_view: WorldView,         # fused perception/state (see §7)
+        world_model: WorldModel | None = None,   # optional verification
+    ) -> None: ...
+
+    def pursue(self, goal: Goal) -> GoalResult:
+        while not goal.success.met(self.world_view):
+            plan = self.planner.plan(goal, self.world_view)      # decompose
+
+            if self.world_model is not None:
+                plan = self._imagine_and_rank(plan)              # verify (§5.1)
+
+            skill = self.registry.resolve(plan.next_goal, self.world_view)
+            if skill is None or not skill.can_run(plan.next_goal, self.world_view):
+                if not self.planner.recover(plan, self.world_view):
+                    return GoalResult.FAILED
+                continue
+
+            self.runtime.swap_controller(skill.controller(plan.next_goal))   # dispatch
+            outcome = self._monitor(skill, plan.next_goal)                   # supervise
+
+            if outcome is SkillStatus.FAILED:
+                self.planner.observe_failure(skill, plan, self.world_view)   # replan next iter
+        return GoalResult.SUCCEEDED
+```
+
+### 5.1 Imagine and verify (world-model in the loop)
+
+```python
+def _imagine_and_rank(self, plan: Plan) -> Plan:
+    obs = self.runtime.robot.get_observation()
+    scored = []
+    for candidate in plan.candidates:                 # a few coarse alternatives
+        actions = self._sketch_actions(candidate)     # skill-level action sketch
+        traj = self.world_model.rollout(obs, actions) # pure, no hardware
+        scored.append((candidate, traj.score))
+    return plan.with_ranking(scored)                  # commit the best; keep the rest
+```
+
+This is the Qwen "imagine then act" pattern: roll a handful of coarse plans forward in the
+world model, rank, commit the best, and **verify on hardware/sim during execution** rather
+than trusting predicted pixels for contact-rich moments.
+
+### 5.2 Monitoring and preemption
+
+`_monitor` polls `skill.status()` and `skill.feedback()` and watches `RobotRuntime`
+telemetry (the `TickEvent` / `LifecycleEvent` stream from Doc A). On success it returns; on
+failure it hands control back to the planner; on a higher-priority interrupt (new user goal,
+safety event) it preempts by swapping in a new controller. Preemption is just another
+`swap_controller()` — the runtime already supports thread-safe controller swap (Doc A §9).
+
+---
+
+## 6. Worked Example: A Qwen-RobotSuite-Style Pipeline
+
+Target: a general agent that navigates, manipulates, and uses a world model to plan — three
+specialized models composed behind one language interface.
+
+```python
+# --- substrates -------------------------------------------------------------
+robot       = G1Robot(...)                         # Observable + Actuable
+world_model = RobotWorldModel.load("./exports/robot_world")   # WorldModel (rollout only)
+
+# --- skills (each wraps a policy as a Controller) ---------------------------
+registry = SkillRegistry()
+registry.register(NavigateSkill(                   # RobotNav → waypoints → tracking Controller
+    policy=InferenceModel.load("./exports/robot_nav"),
+))
+registry.register(PickSkill(                       # RobotManip → PolicyController
+    policy=InferenceModel.load("./exports/robot_manip"),
+    execution=AsyncInferenceExecution(transport="process"),
+))
+registry.register(PlaceSkill(policy=InferenceModel.load("./exports/robot_manip")))
+
+# --- one reactive runtime ---------------------------------------------------
+runtime = RobotRuntime(
+    robot=robot,
+    controller=IdleController(),                   # replaced by the agent per skill
+    fps=30,
+    safety=G1SafetyLayer(),
+    callbacks=[RecordingCallback(...), TelemetryCallback(...)],
+)
+
+# --- one deliberative agent -------------------------------------------------
+agent = Agent(
+    planner=QwenPlanner(tools=registry.as_tools()),   # LLM/VLM, robot skills as tools
+    registry=registry,
+    runtime=runtime,
+    world_view=WorldView(...),                        # fused perception/state
+    world_model=world_model,                          # imagine + verify
+)
+
+with runtime:                                         # runtime loop on its own thread
+    agent.pursue(Goal(
+        kind="task",
+        params={"instruction": "find the green umbrella at the cafe and bring it to me"},
+        success=InstructionSatisfied(),
+    ))
+```
+
+What happens:
+
+1. `QwenPlanner` decomposes the instruction into child goals: `navigate_to(cafe)` →
+   `find(umbrella)` → `pick(umbrella)` → `navigate_to(user)` → `place(...)`.
+2. For branch points ("which approach to the umbrella?"), the agent rolls a few candidates
+   through `RobotWorldModel.rollout()` and commits the best.
+3. Each committed child goal resolves to a `Skill`, whose `Controller` is swapped into the
+   single `RobotRuntime`. RobotNav drives a waypoint-tracking controller; RobotManip drives a
+   `PolicyController`.
+4. The runtime records, applies safety, and streams telemetry the whole time — the same
+   machinery used for a plain policy rollout.
+5. If `PickSkill` reports `FAILED`, the planner observes the failure and replans (new
+   approach, or re-navigate) without ever stopping the runtime loop.
+
+`RobotRuntime` did not change. Studio's `RobotControlWorker` did not change. All agentic
+complexity lives in `Agent`, `Skill`, and the `WorldModel` — above the seam.
+
+---
+
+## 7. CompositeController: Multi-Rate Effector Arbitration
+
+Some robots (humanoids, mobile manipulators) need several action-producing subsystems running
+**concurrently at different rates** and fused into one command per tick — VLA arms at ~20 Hz,
+locomotion at ~100–500 Hz, gaze at ~10 Hz. This is not a separate runtime and not the top of
+the hierarchy. It is **one `Controller` implementation**, `CompositeController`, that a
+`HumanoidSkill` installs like any other.
+
+```python
+class CompositeController:                # implements Doc A's Controller protocol
+    def __init__(
+        self,
+        action_subsystems: Sequence[ActionSubsystem],   # produce effector-scoped fragments
+        info_subsystems: Sequence[InfoSubsystem] = (),   # perception/world/planner feeds
+        arbiter: ActionArbiter = DefaultActionArbiter(),
+        scheduler: SubsystemScheduler = CooperativeScheduler(),
+    ) -> None: ...
+
+    def update(self, observation: Observation) -> RobotAction:
+        self._state.publish("observation", observation)
+        self._scheduler.tick(now())                       # runs 0..N subsystems this tick
+        fragments = self._state.read_action_fragments()
+        return self._arbiter.merge(fragments, observation, now())
+```
+
+Internally it uses three mechanisms — all **implementation details of this one controller**,
+not top-level architecture:
+
+- **Effector-scoped fragments.** Subsystems emit namespaced commands
+  (`{"left_arm": {...}, "base": {"twist": ...}}`) per
+  [`../robot-interface.md`](../robot-interface.md#namespaced-action-examples).
+- **Arbiter.** Merges fragments by priority + freshness + leases (single-writer effectors
+  like `base`), applying a per-effector degrade policy (`hold` / `safe` / `omit`) when a
+  fragment is stale or missing.
+- **Shared state + scheduler.** A typed, timestamped, in-process state cache (single writer
+  per key, latest-value-only) plus a cooperative scheduler that runs each subsystem at its
+  declared rate, with `execution="thread" | "process"` escape hatches for slow subsystems
+  (heavy VLA, world-model updates) so the control tick never blocks.
+
+```text
+CompositeController.update() tick:
+  publish observation
+  scheduler.tick(now)                      # perception, planner, vla, locomotion, gaze
+  fragments = read latest per subsystem
+  return arbiter.merge(fragments)          # priority + freshness + leases + degrade
+```
+
+An `ActionSubsystem` for arms may itself wrap a `PolicyController` + `InferenceExecution` +
+`ActionQueue`. Composite autonomy reuses the inference stack; it does not duplicate it.
+
+> The shared-state cache here is deliberately small and private. It is a mechanism for
+> fusing concurrent subsystems inside one controller — **not** a system-wide message bus and
+> **not** the interface between the Agent and the runtime. That interface is `Goal` / `Skill`
+> (§4). History and replay belong in the recording callback (Doc A §6), not this cache.
+
+### Subsystem protocols
 
 ```python
 class RuntimeSubsystem(Protocol):
     name: str
-    rate_hz: float | None      # None = event-driven, no fixed schedule
-
+    rate_hz: float | None                      # None = event-driven
     def start(self, ctx: SubsystemContext) -> None: ...
     def stop(self) -> None: ...
-    def reset(self) -> None: ...
     def health(self) -> SubsystemHealth: ...
-```
 
-`SubsystemContext` exposes the blackboard (read/write), a clock, and configuration. `SubsystemHealth` carries a status enum (`OK | DEGRADED | FAILED | STARTING | STOPPED`), a timestamp, and a free-form message.
-
-### 5.2 InfoSubsystem (perception, world model, planner)
-
-Produces intermediate state into the blackboard. Does **not** produce `RobotAction`.
-
-```python
 class InfoSubsystem(RuntimeSubsystem, Protocol):
-    def step(self, ctx: SubsystemContext) -> None:
-        """Read inputs from blackboard, write outputs to blackboard."""
-```
+    def step(self, ctx: SubsystemContext) -> None: ...          # writes state, no action
 
-Examples:
-
-```python
-class PerceptionSubsystem(InfoSubsystem):
-    name = "perception"
-    rate_hz = 30.0
-    def step(self, ctx):
-        obs = ctx.blackboard.read("observation")
-        scene = self._detect(obs.images)
-        ctx.blackboard.write("scene", scene, ttl_s=0.2)
-```
-
-### 5.3 ActionSubsystem (VLA, locomotion, scripted)
-
-Produces a `RobotAction` fragment for one or more effectors.
-
-```python
 class ActionSubsystem(RuntimeSubsystem, Protocol):
-    effectors: frozenset[str]   # e.g., {"left_arm", "right_arm"}
-    priority: int               # higher wins on conflict (see Arbiter)
-
-    def step(self, ctx: SubsystemContext) -> ActionFragment:
-        """Return action fragment for this subsystem's effectors."""
+    effectors: frozenset[str]
+    priority: int
+    def step(self, ctx: SubsystemContext) -> ActionFragment: ...  # effector-scoped command
 ```
 
-```python
-@dataclass(frozen=True)
-class ActionFragment:
-    source: str                       # subsystem name
-    fragment: Mapping[str, Any]       # effector-scoped, see robot-interface.md
-    timestamp: float                  # producer time
-    valid_until: float | None = None  # explicit freshness deadline
-    confidence: float = 1.0
-```
-
-Example:
-
-```python
-class VLAArmSubsystem(ActionSubsystem):
-    name = "vla_arms"
-    rate_hz = 20.0
-    effectors = frozenset({"left_arm", "right_arm"})
-    priority = 10
-
-    def step(self, ctx):
-        obs   = ctx.blackboard.read("observation")
-        scene = ctx.blackboard.read("scene", default=None)
-        intent = ctx.blackboard.read("intent", default=None)
-        enriched = enrich(obs, scene=scene, intent=intent)
-        # PolicyController-style internals omitted for brevity
-        chunk = self._policy.predict_action_chunk(enriched)
-        a = chunk[0]
-        return ActionFragment(
-            source=self.name,
-            fragment={
-                "left_arm":  {"joint_positions": a[:7], "mode": "position"},
-                "right_arm": {"joint_positions": a[7:14], "mode": "position"},
-            },
-            timestamp=ctx.clock.now(),
-            valid_until=ctx.clock.now() + 0.15,
-        )
-```
-
-A VLA `ActionSubsystem` may internally reuse Doc A's `PolicyController`, `InferenceExecution`, and `ActionQueue`. Composite autonomy does not reinvent the inference plumbing.
+Failure handling is local: a subsystem that raises or stalls is marked `DEGRADED` / `FAILED`
+and the arbiter applies that effector's degrade policy. The scheduler **never** kills the
+control loop — loop termination is `RobotRuntime`'s job (Doc A §8).
 
 ---
 
-## 6. Blackboard
+## 8. Execution and Scaling
 
-A typed, timestamped, in-process key-value cache with freshness semantics.
+The layer starts single-process and grows outward without changing the contracts:
 
-```python
-class Blackboard:
-    def write(self, key: str, value: Any, *, ttl_s: float | None = None) -> None: ...
-    def read(self, key: str, *, default: Any = _MISSING, max_age_s: float | None = None) -> Any: ...
-    def read_entry(self, key: str) -> BlackboardEntry | None: ...
-    def keys(self) -> Iterable[str]: ...
-    def subscribe(self, key: str, callback: Callable[[BlackboardEntry], None]) -> Subscription: ...
-```
+| Stage | Agent | World model | Skills / subsystems | State sharing |
+| ----- | ----- | ----------- | ------------------- | ------------- |
+| 1 (initial) | in-process thread | in-process | in-process controllers | in-process cache |
+| 2 | in-process thread | GPU worker process | `execution="process"` per heavy skill | in-process cache + IPC to workers |
+| 3 (future) | separate process/host | dedicated service | distributed subsystems | cross-process store (deferred) |
 
-```python
-@dataclass(frozen=True)
-class BlackboardEntry:
-    key: str
-    value: Any
-    timestamp: float
-    ttl_s: float | None
-    writer: str
-```
+The contract that survives every stage: the Agent talks to `RobotRuntime` only through
+`Goal`/`Skill` + `swap_controller()`, and every substrate is `Observable`/`Actuable`/
+`WorldModel`. A 20B world model on its own GPU, a 4B VLA in a worker process, and locomotion
+behind a ROS 2 adapter can all coexist without the reactive loop learning about any of it.
 
-Rules:
-
-- Writes are atomic per key; readers always see a consistent snapshot of one entry.
-- A read with `max_age_s` returns the default when the entry is older than the threshold (data is stale, treat as absent).
-- Single writer per key by convention. Multi-writer keys require an explicit merge function registered at construction.
-- Subscriptions fire synchronously on the writer's thread. Subscribers must not block.
-- The blackboard is **not** a message queue. Consumers see only the latest value, never a history.
-
-This is deliberately closer to a behavior-tree blackboard than a ROS topic. History/replay belongs in the recording callback (Doc A §6.3) or a separate logger, not the blackboard.
+Cross-process / cross-host state sharing is deferred until a concrete integration needs it
+(§11). Starting in-process is a deliberate simplification, not a ceiling.
 
 ---
 
-## 7. Multi-Rate Scheduler
+## 9. Safety Across Layers
 
-A cooperative scheduler that runs subsystems at their declared rates from a single thread by default, with per-subsystem worker-thread escape hatches.
-
-### Default: cooperative
+Safety is enforced at the **reactive** layer, always, regardless of what the agent decided:
 
 ```text
-scheduler.tick(now):
-  for subsystem in subsystems:
-    if now >= subsystem.next_tick:
-      try:
-        subsystem.step(ctx)
-        subsystem.next_tick = now + 1.0 / subsystem.rate_hz
-      except Exception as e:
-        record_failure(subsystem, e)
-        # do not raise; arbiter handles degrade
+controller.update() → callbacks.before_send_action → SafetyLayer.filter → robot.send_action
 ```
 
-The cooperative scheduler is enough when every subsystem's `step()` is faster than the smallest period it shares with `RobotRuntime`'s tick. This is realistic for perception/planner subsystems on modern hosts.
+- The **Agent** resolves *intent* (which skill, which plan). It is not a safety authority.
+- The **arbiter** (inside `CompositeController`) resolves *conflicts* between subsystems. It
+  is not a safety authority.
+- **`SafetyLayer`** (Doc A) enforces *hard constraints* as the last gate before actuation. A
+  `SafetyViolationError` stops the loop no matter which controller produced the action.
 
-### Worker-thread subsystems
-
-Slow subsystems (heavy VLA inference, world-model updates) declare `execution="thread"` (or `"process"`). The scheduler then:
-
-- Owns one background worker per such subsystem.
-- The cooperative `tick()` only **enqueues** a step request; the worker runs `step()` and writes results to the blackboard.
-- The control tick continues using the latest blackboard entry, never blocking on the worker.
-
-This mirrors Doc A's `InferenceExecution` design and is the same idea: the slow thing happens off the control thread, the consumer reads cached output.
-
-### Real-time considerations
-
-True real-time scheduling (preempt, deadline) is out of scope for the Python-side scheduler. Time-critical subsystems (locomotion balance, joint servoing) belong in the `Robot` driver or vendor stack, exposed to the autonomy layer through a `RuntimeSubsystem` adapter that publishes status.
-
-### Failure handling
-
-Per-subsystem failure modes:
-
-| Failure                                | Scheduler behavior                                                |
-| -------------------------------------- | ----------------------------------------------------------------- |
-| `step()` raises                        | log, mark `health = FAILED`, retry next tick                      |
-| `step()` exceeds period repeatedly     | mark `health = DEGRADED`, keep running                            |
-| Worker thread/process dies             | mark `health = FAILED`, `AutonomyController.health()` reflects it |
-| Subsystem reports `health = FAILED`    | scheduler keeps ticking; arbiter applies degrade for that effector |
-
-The scheduler **never** kills the control loop. Loop termination is `RobotRuntime`'s job (Doc A §8.5).
+This layering means a mis-planned goal or a mis-arbitrated fragment still cannot drive the
+robot outside its safety envelope. World-model verification (§5.1) is an *additional* upstream
+filter, never a replacement for `SafetyLayer`.
 
 ---
 
-## 8. ActionArbiter
+## 10. Prior Art
 
-Merges effector-scoped action fragments into one `RobotAction`. Resolves conflicts when multiple subsystems write to the same effector.
+What to borrow, what to avoid.
 
-```python
-class ActionArbiter(Protocol):
-    def merge(
-        self,
-        fragments: Sequence[ActionFragment],
-        observation: Observation,
-        now: float,
-    ) -> RobotAction: ...
-```
+| System | Steal | Avoid |
+| ------ | ----- | ----- |
+| **Hierarchical VLA (System 2 / System 1)** | deliberative planner over reactive policy; language goals as the high-level interface | assuming one model does both jobs well |
+| **ROS 2 actions / services** | long-running goal lifecycle (propose → feedback → result); the `Goal`/`Skill` contract | mandatory `rclpy` dependency; ROS message types in core |
+| **Behavior trees (py_trees)** | tick/status model, skill-level arbitration | forcing every skill to be a BT node |
+| **Classic 3T / three-layer** | deliberator / sequencer / controller separation | rigid layer boundaries that forbid reactive shortcuts |
+| **Boston Dynamics SDK** | leases (single-writer effectors), e-stop, command authority | proprietary robot-specific assumptions |
+| **World-model planners (Dreamer-style, RobotWorld)** | imagine-and-rank before acting; world model as a ranking signal | closing the loop on predicted pixels for contact-rich control |
+| **LeRobot** | robot/policy/dataset ergonomics, naming | using it as an autonomy architecture (it isn't one) |
 
-### Default arbiter rules
-
-1. **Filter stale fragments.** Drop any fragment with `valid_until < now`.
-2. **Group by effector.** Each fragment contributes to one or more effector keys.
-3. **Resolve conflicts.** For an effector claimed by multiple fragments, the **higher `priority`** wins. Ties broken by most recent `timestamp`.
-4. **Per-effector degrade.** If no fresh fragment is available for an effector that the robot expects, apply the configured degrade policy:
-   - `hold` — repeat last sent value for that effector.
-   - `safe` — send a safe default (e.g., zero base twist, hands open).
-   - `omit` — send no command for that effector this tick (the driver decides).
-5. **Compose** the surviving per-effector commands into one mapping and return it.
-
-### Authority / leasing
-
-For effectors that must have a single writer at a time (typical for base motion to avoid fighting subsystems), the arbiter supports **leases**:
-
-```python
-arbiter.grant_lease(effector="base", subsystem="locomotion")
-```
-
-While a lease is active, fragments from other subsystems for that effector are rejected with a logged warning. Leases are the BD-SDK pattern adapted to Python-process scope and are the simplest way to prevent VLA / planner / locomotion fights.
-
-### Safety boundary
-
-The arbiter is **not** the safety layer. Doc A's `SafetyLayer` still runs after `callbacks.before_send_action` and is the last gate before `robot.send_action`. The arbiter resolves *intent conflicts*; safety enforces *hard constraints*.
+**ROS 2 verdict:** optional integration boundary, not the core runtime. Complex subsystems
+(vendor locomotion) enter as a `RuntimeSubsystem` adapter inside a `CompositeController`; the
+autonomy graph stays PhysicalAI-native.
 
 ---
 
-## 9. Effector-Scoped Actions
-
-Composite robots use the namespaced `RobotAction` form from [`../robot-interface.md`](../robot-interface.md#namespaced-action-examples):
-
-```python
-{
-    "base":       {"twist": np.array([vx, vy, wz])},
-    "torso":      {"joint_positions": q_torso, "mode": "position"},
-    "left_arm":   {"joint_positions": q_la,    "mode": "position"},
-    "right_arm":  {"joint_velocities": qd_ra,  "mode": "velocity"},
-    "left_hand":  {"joint_positions": q_lh},
-    "right_hand": {"grasp_force": 0.6},
-    "head":       {"joint_positions": q_head},
-}
-```
-
-Subsystems own subsets of these keys via `effectors`. The composite `Robot` driver routes each effector to the right hardware controller. Effectors absent from the action mean "no command this tick"; it is the driver's job to decide whether to hold, decay, or refuse.
-
----
-
-## 10. Worked Example: Unitree G1-Style Humanoid
-
-```python
-runtime = RobotRuntime(
-    robot=G1Robot(...),                       # composite Robot driver
-    controller=AutonomyController(
-        subsystems=[
-            PerceptionSubsystem(rate_hz=30),
-            WorldModelSubsystem(rate_hz=10, execution="thread"),
-            PlannerSubsystem(rate_hz=1),
-            VLAArmSubsystem(                  # left+right arms, hands
-                rate_hz=20,
-                policy_controller=PolicyController(
-                    model=arm_model,
-                    execution=AsyncInferenceExecution(transport="process"),
-                ),
-                effectors={"left_arm", "right_arm", "left_hand", "right_hand"},
-                priority=10,
-            ),
-            ROS2LocomotionSubsystem(          # base + balance via vendor ROS stack
-                effectors={"base", "torso"},
-                priority=20,
-            ),
-            HeadGazeSubsystem(rate_hz=10, effectors={"head"}, priority=5),
-        ],
-        arbiter=DefaultActionArbiter(
-            degrade={
-                "base":  "safe",   # zero twist if locomotion is stale
-                "torso": "hold",
-                "left_arm":   "hold",
-                "right_arm":  "hold",
-                "left_hand":  "hold",
-                "right_hand": "hold",
-                "head":  "omit",
-            },
-            leases={"base": "locomotion"},
-        ),
-    ),
-    fps=50,
-    safety=G1SafetyLayer(),
-    callbacks=[RecordingCallback(...), TelemetryCallback(...)],
-)
-runtime.run()
-```
-
-What happens per tick (50 Hz):
-
-- `RobotRuntime` reads `Robot.get_observation()` (G1 driver returns base state, joints, IMU, cameras).
-- `AutonomyController.update()` publishes the observation.
-- The scheduler ticks subsystems whose deadline has fired:
-  - Perception runs every ~33 ms in-line.
-  - World model runs in a worker thread; control tick reads its latest output.
-  - Planner runs every ~1 s in-line.
-  - VLA runs every ~50 ms in a worker process; arm/hand fragments updated.
-  - Locomotion is event-driven from a ROS subscription; base/torso fragments updated each ROS callback.
-  - Head subsystem runs every ~100 ms in-line.
-- The arbiter merges fragments using the lease (locomotion owns `base`), per-effector priorities, and freshness; absent fragments fall back to their `degrade` policy.
-- `RobotRuntime` runs callbacks → safety → `G1Robot.send_action(merged_action)`.
-
-`RobotRuntime` does not change. Studio's `RobotControlWorker` does not change. The composite-robot complexity is fully contained in `AutonomyController` and the `G1Robot` driver.
-
----
-
-## 11. AutonomyRuntime: Why Not (Yet)
-
-A separate `AutonomyRuntime` is **not** introduced. Reasons to keep composite autonomy as a `Controller`:
-
-- One outer loop is easier to reason about, record, and supervise.
-- Doc A's lifecycle, safety, callbacks, and error handling apply unchanged.
-- `RobotRuntime` already supports thread-safe controller swap (Doc A §9), enabling autonomy hot-load.
-
-A future `AutonomyRuntime` becomes warranted only when one of the following is real:
-
-- Multi-process subsystem lifecycle that PhysicalAI must own end-to-end.
-- A native ROS 2 graph that owns the control loop and PhysicalAI is a node inside it.
-- Hard real-time scheduling outside the Python loop (e.g., a separate C++ control process with PhysicalAI as a planner client).
-
-When that happens, `AutonomyController` becomes the in-process façade to a separate runtime; the contract upward (`Controller`) does not have to change.
-
----
-
-## 12. Manifest And Configuration
-
-Composite manifests extend the per-robot schema with per-effector entries. A sketch:
-
-```json
-{
-  "format": "policy_package",
-  "version": "1.0",
-  "robots": [
-    {
-      "name": "g1",
-      "type": "Unitree-G1",
-      "effectors": {
-        "base":       {"command": "twist",            "shape": [3]},
-        "torso":      {"command": "joint_positions",  "shape": [4]},
-        "left_arm":   {"command": "joint_positions",  "shape": [7], "mode": "position"},
-        "right_arm":  {"command": "joint_positions",  "shape": [7], "mode": "position"},
-        "left_hand":  {"command": "joint_positions",  "shape": [6]},
-        "right_hand": {"command": "joint_positions",  "shape": [6]},
-        "head":       {"command": "joint_positions",  "shape": [2]}
-      }
-    }
-  ],
-  "cameras": [...]
-}
-```
-
-A composite policy manifest would declare which **effector subsets** it produces (e.g., a bimanual VLA that produces `left_arm` + `right_arm` + hands). The `AutonomyController` config wires each subsystem to its effector subset and registers the corresponding lease/priority.
-
-The exact composite manifest schema is deferred until the first composite driver is integrated. Until then, the existing flat-vector manifest (Doc A) remains canonical.
-
----
-
-## 13. What This Doc Does NOT Define
+## 11. What This Doc Does NOT Define
 
 Deferred until a concrete need arises:
 
-- `AutonomyRuntime` (separate runtime; see §11).
-- Typed `RobotAction` / `Effector` dataclass hierarchy (use mappings; see [`../robot-interface.md`](../robot-interface.md)).
-- Cross-process / cross-host blackboard (start in-process).
-- Behavior-tree dependency for arbitration (the arbiter is a function, not a BT).
-- ROS 2 message-type imports anywhere outside ROS 2 subsystem adapters.
-- Generic robot transport / data-plane abstraction (see Doc A §10).
-- Real-time scheduling guarantees from the Python-side scheduler.
-- Composite manifest schema beyond the §12 sketch.
+- **Planner internals.** The `Planner` (LLM/VLM prompting, decomposition, recovery policy) is
+  a pluggable strategy, not fixed here.
+- **World-model training or interface details** beyond the `rollout()` contract.
+- **Typed `RobotAction` / `Effector` class hierarchy.** Use namespaced mappings
+  ([`../robot-interface.md`](../robot-interface.md)).
+- **Cross-process / cross-host state store.** Start in-process (§8).
+- **A separate `AutonomyRuntime`.** Not introduced — one `RobotRuntime` loop with
+  controller-swap is sufficient. A separate runtime becomes warranted only for
+  PhysicalAI-owned multi-process subsystem lifecycles, a native ROS 2 graph that owns the
+  loop, or hard real-time scheduling in a non-Python control process. If that day comes,
+  `Skill`/`Controller` and `Goal` stay stable; only the executor beneath them changes.
+- **Composite manifest schema** beyond the per-effector sketch in Doc A's ecosystem.
+- **Real-time scheduling guarantees** from the Python scheduler. Time-critical control lives
+  in the `Robot` driver / vendor stack.
 
 ---
 
-## 14. Decision Summary
+## 12. Decision Summary
 
 ```text
-composite autonomy contract        AutonomyController implements Doc A's Controller
-no new outer runtime               RobotRuntime stays the only outer loop
-subsystems share state             Blackboard (typed, timestamped, single-writer-by-default)
-scheduling                         cooperative by default, worker thread/process per subsystem on demand
-multi-source action assembly       ActionArbiter with priority + freshness + leases
-effector contract                  namespaced RobotAction mappings (../robot-interface.md)
-ROS 2                              optional integration via subsystem adapters; not foundational
-real-time control                  in the Robot driver / vendor stack, exposed via subsystems
-relationship to PolicyController   ActionSubsystems may internally reuse PolicyController + InferenceExecution
-implementation trigger             defer until a concrete composite-robot integration is in scope
+architecture                       dual-process: deliberative Agent (System 2) over reactive RobotRuntime (System 1)
+the seam                           Goal / Skill — long-running, with status + feedback (robot skills as callable tools)
+skill execution                    a Skill produces a Controller; Agent runs it via RobotRuntime.swap_controller()
+no new outer runtime               RobotRuntime stays the only control loop
+environment                        capability protocols: Observable / Actuable / Resettable / WorldModel
+real vs sim vs world model         same Observation/Action substrate; runtime needs only Observable+Actuable
+verification                       WorldModel.rollout() is pure; Agent imagines + ranks, verifies on hardware/sim
+multi-rate composite               CompositeController is ONE Controller (arbiter + effectors + scheduler inside)
+shared state                       private, in-process cache inside CompositeController — a mechanism, not the architecture
+safety                             enforced by SafetyLayer at the reactive layer, last gate before actuation
+scaling                            in-process → worker process → distributed, contracts unchanged
+implementation trigger             defer until a concrete agentic / composite-robot integration is in scope
 ```
 
-The composite layer adds zero burden to single-arm robots, keeps Doc A's small surface intact, and provides a clear path for humanoids and mobile manipulators when the first one lands.
+This layer turns PhysicalAI from "run one policy on one robot" into "pursue a language goal
+by planning, imagining, and dispatching skills" — while keeping Doc A's small, predictable
+control loop completely intact. The agent plans; the world model imagines; skills execute as
+controllers; `RobotRuntime` runs the loop; `SafetyLayer` has the final say.
