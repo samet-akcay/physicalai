@@ -44,27 +44,27 @@ split used by hierarchical VLA stacks, and it is the same shape as the classic t
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
-│  AGENT   —  System 2  ·  deliberative  ·  ~0.1–1 Hz  ·  async          │
-│                                                                        │
-│    perceive → plan (LLM/VLM) → imagine (WorldModel) → verify           │
-│            → commit Goal → dispatch Skill → monitor → replan           │
-│                                                                        │
-│    reads:  WorldView (fused state)                                     │
-│    uses:   WorldModel.rollout()  for counterfactual verification       │
-│    emits:  Goal, and the Skill that pursues it                         │
+│  AGENT   —  System 2  ·  deliberative  ·  ~0.1–1 Hz  ·  async        │
+│                                                                      │
+│    perceive → plan (LLM/VLM) → imagine (WorldModel) → verify         │
+│            → commit Goal → dispatch Skill → monitor → replan         │
+│                                                                      │
+│    reads:  WorldView (fused state)                                   │
+│    uses:   WorldModel.rollout()  for counterfactual verification     │
+│    emits:  Goal, and the Skill that pursues it                       │
 └───────────────────────────────┬──────────────────────────────────────┘
-                                 │  Goal / Skill
-                                 │  (long-running, with status + feedback)
-                                 ▼
+                                │  Goal / Skill
+                                │  (long-running, with status + feedback)
+                                ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  RobotRuntime   —  System 1  ·  reactive  ·  fixed FPS  ·  sync        │
-│                                                                        │
-│    runs the ACTIVE Controller that the current Skill installed         │
-│    observation → controller.update() → safety → send_action            │
-│                                                                        │
-│    Doc A. UNCHANGED.                                                    │
+│  RobotRuntime   —  System 1  ·  reactive  ·  fixed FPS  ·  sync      │
+│                                                                      │
+│    runs the ACTIVE Controller that the current Skill installed       │
+│    observation → controller.update() → safety → send_action          │
+│                                                                      │
+│    Doc A. UNCHANGED.                                                 │
 └───────────────────────────────┬──────────────────────────────────────┘
-                                 ▼
+                                ▼
         Environment (Robot │ Sim)            WorldModel (predictive only)
 ```
 
@@ -124,7 +124,7 @@ The layer must:
   (Doc A §5). Skills reuse it.
 - Becoming a distributed actor framework. The initial layer is single-process with
   per-subsystem worker escape hatches (§8).
-- Training the planner, world model, or policies. This is a runtime/serving layer.
+- Training the planner, world model, or policies. This is a training/studio layer.
 
 ---
 
