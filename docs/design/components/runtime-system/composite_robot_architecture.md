@@ -1,68 +1,70 @@
-# Agentic Autonomy Layer
+# Agentic Autonomy Layer (System 2)
 
 This document defines the **agentic autonomy layer** for PhysicalAI: the deliberative
-system that turns a language goal into grounded robot behavior by planning, imagining
-outcomes in a world model, verifying, and dispatching skills to the reactive runtime.
+system that turns a language goal into grounded robot behavior by perceiving, planning,
+optionally imagining outcomes in a world model, and dispatching skills to the reactive
+runtime.
 
-It builds on the production single-rate runtime in
-[`robot_runtime_architecture.md`](./robot_runtime_architecture.md) (Doc A). It does **not**
-replace it. The whole autonomy stack still executes through **one `RobotRuntime` loop**;
-this document defines the layer that sits *above* it and decides *what that loop should be
-doing right now*.
+It builds on the single-rate reactive runtime introduced in PR #179
+([`runtime-architecture.md`](./runtime-architecture.md), "Doc A"): one `RobotRuntime`
+loop driving one `ActionSource` at a fixed rate. This document does **not** replace that
+loop. The whole autonomy stack executes through it; this layer decides *what the loop
+should be doing right now*.
 
-It is intentionally future-facing. No code here should be implemented before a concrete
-agentic integration (e.g. a Qwen-RobotSuite-style planner + VLA + world model, or a Unitree
-G1 humanoid) is in scope. The purpose of writing it now is to ensure Doc A's contracts
-(`Controller`, `Robot`, `RobotAction`, `Observation`) extend cleanly to full autonomy
-without rework.
+It is intentionally future-facing. Nothing here should be implemented before a concrete
+agentic integration (e.g. an LLM/VLM planner + VLA skills + world model, or a humanoid
+platform) is in scope. The purpose of writing it now is to ensure Doc A's contracts
+extend cleanly to full autonomy without rework — and to name the small amendments Doc A
+needs (§2.1) while its API is still young.
 
 ---
 
 ## Quick Navigation
 
 - [1. The Dual-Process Architecture](#1-the-dual-process-architecture)
-- [2. Scope and Non-Goals](#2-scope-and-non-goals)
+- [2. Scope, Non-Goals, and Doc A Prerequisites](#2-scope-non-goals-and-doc-a-prerequisites)
 - [3. Environment: One Substrate for Real, Sim, and World Model](#3-environment-one-substrate-for-real-sim-and-world-model)
-- [4. Goal and Skill: The Seam Between the Loops](#4-goal-and-skill-the-seam-between-the-loops)
-- [5. The Agent Loop](#5-the-agent-loop)
-- [6. Worked Example: A Qwen-RobotSuite-Style Pipeline](#6-worked-example-a-qwen-robotsuite-style-pipeline)
-- [7. CompositeController: Multi-Rate Effector Arbitration](#7-compositecontroller-multi-rate-effector-arbitration)
-- [8. Execution and Scaling](#8-execution-and-scaling)
-- [9. Safety Across Layers](#9-safety-across-layers)
-- [10. Prior Art](#10-prior-art)
-- [11. What This Doc Does NOT Define](#11-what-this-doc-does-not-define)
-- [12. Decision Summary](#12-decision-summary)
+- [4. WorldView: Perception and Fused State](#4-worldview-perception-and-fused-state)
+- [5. Goal, Skill, and SkillExecution: The Seam Between the Loops](#5-goal-skill-and-skillexecution-the-seam-between-the-loops)
+- [6. The Agent: An Event-Driven Tool Loop](#6-the-agent-an-event-driven-tool-loop)
+- [7. The Data Flywheel](#7-the-data-flywheel)
+- [8. CompositeSource: Multi-Rate Effector Arbitration](#8-compositesource-multi-rate-effector-arbitration)
+- [9. Execution and Scaling](#9-execution-and-scaling)
+- [10. Safety Across Layers](#10-safety-across-layers)
+- [11. Prior Art](#11-prior-art)
+- [12. What This Doc Does NOT Define](#12-what-this-doc-does-not-define)
+- [13. Implementation Sequencing](#13-implementation-sequencing)
+- [14. Decision Summary](#14-decision-summary)
 
 ---
 
 ## 1. The Dual-Process Architecture
 
-Modern robot autonomy is a **two-loop hierarchy**. A slow deliberative process reasons about
-goals; a fast reactive process controls the hardware. This is the "System 2 / System 1"
-split used by hierarchical VLA stacks, and it is the same shape as the classic three-layer
-(deliberator / sequencer / controller) robotics architectures.
+Modern robot autonomy is a **two-loop hierarchy**. A slow deliberative process reasons
+about goals; a fast reactive process controls the hardware. This is the "System 2 /
+System 1" split used by hierarchical VLA stacks (Helix, π0-style planner+policy,
+Gemini Robotics ER + VLA), and the same shape as the classic three-layer
+deliberator / sequencer / controller architectures.
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
-│  AGENT   —  System 2  ·  deliberative  ·  ~0.1–1 Hz  ·  async        │
+│  AGENT   —  System 2  ·  deliberative  ·  event-driven  ·  async     │
 │                                                                      │
-│    perceive → plan (LLM/VLM) → imagine (WorldModel) → verify         │
-│            → commit Goal → dispatch Skill → monitor → replan         │
-│                                                                      │
-│    reads:  WorldView (fused state)                                   │
-│    uses:   WorldModel.rollout()  for counterfactual verification     │
-│    emits:  Goal, and the Skill that pursues it                       │
+│    goals & interrupts in → LLM/VLM tool loop over skills             │
+│    reads:  WorldView (fused state, §4)                               │
+│    uses:   WorldModel.rollout() to imagine/rank candidate plans      │
+│    emits:  skill dispatches; receives SkillExecution handles (§5)    │
 └───────────────────────────────┬──────────────────────────────────────┘
-                                │  Goal / Skill
-                                │  (long-running, with status + feedback)
+                                │  dispatch(goal) → SkillExecution
+                                │  (status · feedback · cancel · result)
                                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  RobotRuntime   —  System 1  ·  reactive  ·  fixed FPS  ·  sync      │
 │                                                                      │
-│    runs the ACTIVE Controller that the current Skill installed       │
-│    observation → controller.update() → safety → send_action          │
+│    runs the ActionSource that the current skill installed            │
+│    read obs → source.update() → callbacks → safety → send_action     │
 │                                                                      │
-│    Doc A. UNCHANGED.                                                 │
+│    Doc A, with the §2.1 amendments. Otherwise UNCHANGED.             │
 └───────────────────────────────┬──────────────────────────────────────┘
                                 ▼
         Environment (Robot │ Sim)            WorldModel (predictive only)
@@ -71,86 +73,116 @@ split used by hierarchical VLA stacks, and it is the same shape as the classic t
 The single most important design decision:
 
 ```text
-A Skill is realized as a Controller.
-The Agent executes a Skill by calling RobotRuntime.swap_controller().
+A Skill is executed by producing an ActionSource.
+The Agent runs it through the one RobotRuntime loop, and supervises it
+through a SkillExecution handle.
 ```
 
-There is still exactly one outer loop. The Agent never touches hardware and never runs a
-second control loop. It selects *which* `Controller` the one `RobotRuntime` should run next.
-Everything Doc A already provides — fixed-rate timing, callbacks, recording, telemetry,
-safety, error recovery — applies unchanged to fully autonomous behavior.
+There is exactly one outer control loop. The Agent never touches hardware and never
+runs a second control loop. It selects *which* `ActionSource` the one `RobotRuntime`
+runs next, and observes progress through the runtime's event stream. Everything Doc A
+provides — fixed-rate timing, resilient IO, callbacks, telemetry — applies unchanged to
+fully autonomous behavior.
 
 ### Why the seam matters
 
-The gap in a pure reactive design (e.g. a blackboard with per-tick arbitration) is that it
-has no vocabulary for **long-running, goal-directed work with feedback**: "navigate to the
-umbrella", "pick the mug", "if the grasp fails, retry from a new approach". That is the
-`Goal` / `Skill` contract (§4). It is the robotics equivalent of a long-running action
-(propose → executing → succeeded / failed), and it is what lets a general agent treat robot
-capabilities as **callable tools**.
+A pure reactive design has no vocabulary for **long-running, goal-directed work with
+feedback**: "navigate to the umbrella", "pick the mug", "if the grasp fails, retry from
+a new approach". That vocabulary is the `Goal` / `Skill` / `SkillExecution` contract
+(§5). It is the robotics equivalent of a long-running action (dispatch → feedback →
+result), and it is what lets a general agent treat robot capabilities as **callable
+tools** (§6).
 
 ---
 
-## 2. Scope and Non-Goals
+## 2. Scope, Non-Goals, and Doc A Prerequisites
 
 ### Scope
 
-A reusable deliberative layer for robots whose behavior is driven by a planner or agent that
-composes multiple decision-making systems:
+A reusable deliberative layer for robots whose behavior is driven by an agent composing
+multiple decision-making systems:
 
-- A **high-level planner / agent** (LLM or VLM) that decomposes language goals into skills.
-- A **world model** used to imagine and rank candidate plans before spending real robot time.
+- A **high-level agent** (LLM or VLM) that decomposes language goals into skill calls.
+- A **perception/state layer** (`WorldView`, §4) the agent and success checks read.
 - One or more **policies** (VLA manipulation, navigation) invoked as skills.
-- Optional **multi-rate subsystems** (locomotion + arms + gaze) composed into a single tick
-  for humanoids and mobile manipulators (§7).
+- An optional **world model** used to imagine and rank candidate plans before spending
+  real robot time.
+- Optional **multi-rate subsystems** (locomotion + arms + gaze) composed into a single
+  tick for humanoids and mobile manipulators (§8).
 
 The layer must:
 
 1. Turn a `Goal` into robot behavior through skills executed by `RobotRuntime`.
-2. Verify plans against a `WorldModel` without touching hardware.
-3. Run planning off the control thread; never stall the reactive tick.
-4. Monitor skill execution and replan on failure.
-5. Treat real robot, simulator, and world model as the **same `Observation` / `Action`
-   substrate** with different capabilities.
-6. Stay framework-light: no mandatory ROS 2, no mandatory behavior-tree dependency.
+2. Give the agent a supervision handle per execution: status, feedback, cancel, result.
+3. Run deliberation off the control thread; never stall the reactive tick.
+4. Accept goals and interrupts at any time — including mid-execution — and preempt.
+5. Treat real robot, simulator, and world model as the **same observation/action
+   substrate** with different capabilities (§3).
+6. Record every skill execution as a labeled episode for training (§7).
+7. Stay framework-light: no mandatory ROS 2, no mandatory behavior-tree dependency.
 
 ### Non-Goals
 
-- Replacing `RobotRuntime`. The outer loop, lifecycle, callbacks, safety, and dispatch stay
-  in Doc A.
-- Replacing low-level control (joint servoing, gait MPC, balance). Those live in the `Robot`
-  driver or vendor stack.
-- Defining the inference plumbing. That is `PolicyController` + `InferenceExecution`
-  (Doc A §5). Skills reuse it.
+- Replacing `RobotRuntime`. The loop, lifecycle, resilience, and callbacks stay in Doc A.
+- Replacing low-level control (joint servoing, gait MPC, balance). Those live in the
+  `Robot` driver or vendor stack.
+- Defining inference plumbing. That is `PolicySource` + `Execution` + `ActionQueue`
+  (Doc A). Skills reuse it verbatim.
+- Building a planner framework. The agent is an LLM tool loop (§6); we do not define
+  `Plan` trees, recovery strategies, or prompt schemas here.
 - Becoming a distributed actor framework. The initial layer is single-process with
-  per-subsystem worker escape hatches (§8).
-- Training the planner, world model, or policies. This is a training/studio layer.
+  per-subsystem worker escape hatches (§9).
+- Training the planner, world model, or policies. That is the Studio/training layer.
+
+### 2.1 Prerequisites: small amendments to Doc A
+
+This layer requires four additions to the Doc A runtime. All are small, all are
+independently useful for non-agentic use, and all should land while the Doc A API is
+still breaking:
+
+| # | Amendment | Why System 2 needs it |
+| - | --------- | --------------------- |
+| 1 | `RobotRuntime.stop()` — thread-safe request to end the current `run()` at the next tick boundary | Preemption. The agent must be able to abort a running skill (new goal, safety event, teleop takeover). |
+| 2 | `action_source` accepted as a `run()` parameter (robot/cameras stay connected across runs) | Skill dispatch. Each skill execution is one `run()` with that skill's source; the runtime object is long-lived, the source is per-execution. |
+| 3 | A sanctioned completion signal from the source (e.g. a `SourceFinished` control-flow exception, or a `finished` flag the loop checks) | A skill that achieves its goal must be able to end the run without the agent having to infer completion externally. |
+| 4 | A reserved **final safety-gate slot** between the callback chain and `send_action` | §10. Safety must be the guaranteed-last transform, not "a callback that hopes it runs last". |
+
+Additionally, the runtime's event stream (`TickEvent` / `LifecycleEvent` /
+`MetricsEvent`) becomes the **official observation channel** for everything above the
+loop: skill status derivation (§5.4), agent monitoring (§6), and recording (§7) all
+subscribe to it rather than reaching into the loop.
+
+True mid-run source hot-swap is **not** required initially. Sequential per-skill
+`run()` calls, with the robot holding pose between runs, are sufficient for a v1 agent;
+seamless swap becomes worthwhile only when skill-to-skill transitions must be gap-free
+(e.g. locomotion handoffs), and can be added later without changing this document's
+contracts (§6.2).
 
 ---
 
 ## 3. Environment: One Substrate for Real, Sim, and World Model
 
-A Qwen-RobotSuite-style pipeline runs the same behavior **on hardware or in sim**, and uses a
-**world model as a neural simulator** to rank plans. These are not three unrelated interfaces
-— they are the same `Observation` / `Action` types with different *capabilities*. We model
-this with small structural protocols (matching the existing `Robot` Protocol style), not a
-single god-interface.
+An agentic pipeline runs the same behavior **on hardware or in sim**, and may use a
+**world model as a neural simulator** to rank plans. These are not three unrelated
+interfaces — they are the same observation/action types with different *capabilities*.
+We model this with small structural protocols (matching the existing `Robot` Protocol
+style), not a single god-interface.
 
 ```python
 class Observable(Protocol):
-    def get_observation(self) -> Observation: ...
+    def get_observation(self) -> RobotObservation: ...
 
 class Actuable(Protocol):
-    def send_action(self, action: RobotAction, *, goal_time: float = ...) -> None: ...
+    def send_action(self, action: np.ndarray, *, goal_time: float = ...) -> None: ...
 
 class Resettable(Protocol):
-    def reset(self, *, seed: int | None = None) -> Observation: ...
+    def reset(self, *, seed: int | None = None) -> RobotObservation: ...
 
 class WorldModel(Protocol):
     def rollout(
         self,
-        obs: Observation,
-        actions: Sequence[RobotAction],
+        obs: RobotObservation,
+        actions: Sequence[np.ndarray],
     ) -> PredictedTrajectory: ...
 ```
 
@@ -164,29 +196,105 @@ Capability composition:
 
 The rules that keep this clean:
 
-- **`RobotRuntime` depends only on `Observable + Actuable`** — exactly today's `Robot`. The
-  reactive loop never sees `Resettable` or `WorldModel`. Sim and world model are consumed by
-  the **Agent**, not the runtime.
-- **`WorldModel.rollout()` is pure and side-effect free.** It takes an initial observation
-  and a candidate action (or skill) sequence and returns a predicted trajectory plus a score.
-  It never actuates anything. This is what makes "imagine before you act" safe to express.
-- `Robot` is unchanged. A simulator is a drop-in `Observable + Actuable + Resettable` and can
-  back the exact same `RobotRuntime` for offline rollout or CI.
+- **`RobotRuntime` depends only on `Observable + Actuable`** — exactly today's `Robot`.
+  The reactive loop never sees `Resettable` or `WorldModel`. Sim and world model are
+  consumed by the **Agent**, not the runtime.
+- **`WorldModel.rollout()` is pure and side-effect free.** It takes an initial
+  observation and a candidate action sequence and returns a predicted trajectory plus a
+  score. It never actuates anything. This is what makes "imagine before you act" safe
+  to express.
+- `Robot` is unchanged. A simulator is a drop-in `Observable + Actuable + Resettable`
+  and can back the exact same `RobotRuntime` for offline rollout or CI.
 
 `PredictedTrajectory` carries predicted observations, optional per-step scores, and a
-terminal outcome estimate. Because a world model such as Qwen-RobotWorld is a *plausibility
-engine, not a contact-accurate simulator*, the Agent treats rollout scores as a **ranking
-signal for coarse plans**, then verifies the committed plan on hardware or sim (§5).
+terminal outcome estimate. Because a learned world model is a *plausibility engine, not
+a contact-accurate simulator*, the Agent treats rollout scores as a **ranking signal
+for coarse plans**, then verifies the committed plan on hardware or sim during
+execution.
+
+> **Known future break.** The action type today is a flat `np.ndarray` end to end
+> (`ActionSource.update`, callbacks, `Robot.send_action`). Humanoids and mobile
+> manipulators will eventually want **namespaced, effector-scoped actions**
+> (`{"left_arm": ..., "base": ...}`). §8 contains that inside one composite source for
+> now, but if the `Robot` driver itself needs namespaced commands, the substrate type
+> widens — a coordinated breaking change across every layer. Nothing new should grow
+> dependent on "action is always a flat vector".
 
 ---
 
-## 4. Goal and Skill: The Seam Between the Loops
+## 4. WorldView: Perception and Fused State
 
-This is the contract the old reactive-only design was missing. It is the robotics analogue of
-a long-running action: a goal is requested, an execution runs, and it eventually succeeds,
-fails, or is aborted — with feedback along the way.
+Everything deliberative reads fused state: the agent's context, `Skill.can_run()`
+preconditions, and success checks. That state has a name, an owner, and a defined
+freshness model — it is **not** an implicit by-product of the control loop.
 
-### 4.1 Goal
+```python
+class WorldView(Protocol):
+    def get(self, key: str) -> StateEntry | None:
+        """Latest value for a state key, with timestamp and source."""
+
+    def snapshot(self) -> Mapping[str, StateEntry]:
+        """Consistent read of all current state."""
+
+    def subscribe(self, key: str, fn: Callback) -> Subscription: ...
+```
+
+```python
+@dataclass(frozen=True)
+class StateEntry:
+    value: Any            # pose, detection list, occupancy patch, scene caption, ...
+    timestamp: float      # when it was produced (staleness is the reader's decision)
+    source: str           # which perceiver wrote it
+```
+
+Design rules:
+
+- **Single writer per key, latest-value-only.** WorldView is a typed state cache, not
+  a message bus and not a history store. History and replay belong to recording (§7).
+- **Perceivers are their own threads/processes at their own rates.** A detector at
+  5 Hz, a scene captioner (VLM) at 0.2 Hz, proprioception forwarded from the runtime's
+  `TickEvent` stream at tick rate. None of them run inside the control loop.
+- **Readers own staleness policy.** A grasp precondition may require a detection
+  < 500 ms old; a navigation goal check may accept seconds-old localization.
+  `WorldView` reports age; it does not judge it.
+- **Semantic perception is expensive and asynchronous.** "The mug is on the table" may
+  come from a VLM call that takes seconds. The architecture must assume WorldView
+  entries update at wildly different rates — which is exactly why the agent is
+  event-driven (§6) rather than assuming a fresh world snapshot per decision.
+
+### 4.1 Success detection is a perceiver, not a predicate
+
+Deciding "did the pick succeed?" is itself often a model call (a VLM judge, a gripper
+force heuristic, a detector re-query) — asynchronous, rate-limited, and noisy. We
+therefore model success as a **check with a confidence, evaluated against WorldView**,
+not a synchronous boolean:
+
+```python
+class SuccessCheck(Protocol):
+    def evaluate(self, world: WorldView) -> SuccessEstimate:
+        """May be cheap (threshold on a pose) or expensive (VLM judge)."""
+
+@dataclass(frozen=True)
+class SuccessEstimate:
+    met: bool
+    confidence: float          # 0..1; the agent decides what to do with 0.6
+    evidence: Mapping[str, Any] = field(default_factory=dict)
+```
+
+Cheap checks can run per skill-status poll; expensive checks run at skill boundaries.
+The agent — not the runtime, not the skill — decides how much confidence is enough
+before declaring a goal met or dispatching a verification behavior (e.g. "look at the
+gripper").
+
+---
+
+## 5. Goal, Skill, and SkillExecution: The Seam Between the Loops
+
+This is the contract the reactive layer is missing on its own: the robotics analogue of
+a long-running action. A goal is requested, an execution runs with feedback, and it
+eventually succeeds, fails, or is cancelled.
+
+### 5.1 Goal
 
 A `Goal` is a typed, declarative intent with an explicit notion of success.
 
@@ -194,272 +302,278 @@ A `Goal` is a typed, declarative intent with an explicit notion of success.
 @dataclass(frozen=True)
 class Goal:
     kind: str                      # "navigate_to" | "pick" | "place" | ...
-    params: Mapping[str, Any]      # {"object": "mug"} or {"x": 1.2, "y": 0.3, "heading": 0.0}
-    success: SuccessCriterion      # predicate over WorldView / Observation
+    params: Mapping[str, Any]      # {"object": "mug"} or {"x": 1.2, "y": 0.3}
+    success: SuccessCheck          # evaluated against WorldView (§4.1)
     deadline_s: float | None = None
-    parent: GoalId | None = None   # for hierarchical decomposition
+    parent: GoalId | None = None   # provenance when the agent decomposes a task
 ```
 
-Goals form a tree: the planner decomposes a top-level language goal into child goals, each
-satisfiable by a skill.
+Goals form a tree only in the sense of provenance: the agent decomposes a top-level
+language task into child goals, each satisfiable by one skill call. The tree is the
+agent's context, not a persisted plan structure.
 
-### 4.2 Skill
+### 5.2 Skill — a stateless capability factory
 
-A `Skill` is a reusable capability that pursues one kind of `Goal`. Crucially, **a skill is
-executed by producing a `Controller`** — the same `Controller` protocol `RobotRuntime`
-already runs (Doc A §7).
+A `Skill` is a reusable capability that pursues one kind of `Goal`. It is
+**stateless with respect to executions**: registered once, dispatched many times.
+Executing it produces two things — an `ActionSource` for the runtime, and a
+`SkillExecution` handle for the agent.
 
 ```python
 class Skill(Protocol):
     name: str
-    goal_kinds: frozenset[str]                 # which Goal.kind values it handles
+    goal_kinds: frozenset[str]          # which Goal.kind values it handles
+    description: str                    # tool description shown to the LLM agent
 
     def can_run(self, goal: Goal, world: WorldView) -> bool:
         """Precondition check against current fused state."""
 
-    def controller(self, goal: Goal) -> Controller:
-        """Return the Controller that RobotRuntime will run to pursue this goal."""
+    def start(self, goal: Goal, ctx: SkillContext) -> SkillExecution:
+        """Create this execution's ActionSource and its supervision handle."""
+```
+
+`SkillContext` gives the skill what it needs to build the execution: the `WorldView`,
+the runtime's event-stream subscription point, and shared resources (e.g. a loaded
+`InferenceModel` the skill was constructed with).
+
+Examples of the `Skill → ActionSource` mapping:
+
+| Skill            | Goal.kind      | ActionSource it installs                                  |
+| ---------------- | -------------- | --------------------------------------------------------- |
+| `NavigateSkill`  | `navigate_to`  | waypoint-tracking source (consumes nav waypoints)          |
+| `PickSkill`      | `pick`         | `PolicySource(model=manip_vla, execution=...)`             |
+| `PlaceSkill`     | `place`        | `PolicySource(...)` with a place-conditioned task prompt   |
+| `TeleopSkill`    | `teleop`       | `TeleopSource`                                             |
+| `HumanoidSkill`  | `whole_body`   | `CompositeSource` (§8)                                     |
+
+A skill wraps Doc A's `PolicySource`, `Execution`, and `ActionQueue` verbatim. The
+agentic layer does **not** reinvent inference plumbing; it schedules it.
+
+### 5.3 SkillExecution — the supervision handle
+
+**All per-execution state lives on the handle, never on the Skill.** This is what makes
+sequential re-dispatch and (later) concurrent skills on disjoint effectors coherent.
+
+```python
+class SkillExecution(Protocol):
+    id: ExecutionId
+    goal: Goal
+
+    @property
+    def action_source(self) -> ActionSource:
+        """What the dispatcher hands to RobotRuntime.run()."""
 
     def status(self) -> SkillStatus:
-        """RUNNING | SUCCEEDED | FAILED | ABORTED — polled by the Agent."""
+        """PENDING | RUNNING | SUCCEEDED | FAILED | CANCELLED."""
 
     def feedback(self) -> Mapping[str, Any]:
-        """Structured progress for the planner (distance-to-goal, grasp confidence, ...)."""
+        """Structured progress (distance-to-goal, grasp confidence, queue depth...)."""
+
+    def cancel(self) -> None:
+        """Request preemption. Dispatcher stops the runtime run; status → CANCELLED."""
+
+    def result(self) -> SkillResult:
+        """Blocks until terminal. Outcome + evidence + recording reference (§7)."""
 ```
 
-Examples of the `Skill → Controller` mapping:
-
-| Skill            | Goal.kind      | Controller it installs                                     |
-| ---------------- | -------------- | ---------------------------------------------------------- |
-| `NavigateSkill`  | `navigate_to`  | waypoint-tracking `Controller` (consumes nav waypoints)    |
-| `PickSkill`      | `pick`         | `PolicyController(model=manip_vla, execution=...)`         |
-| `PlaceSkill`     | `place`        | `PolicyController(...)` with a place-conditioned prompt    |
-| `TeleopSkill`    | `teleop`       | `TeleopController`                                         |
-| `HumanoidSkill`  | `whole_body`   | `CompositeController` (§7)                                  |
-
-A skill may wrap Doc A's `PolicyController`, `InferenceExecution`, and `ActionQueue` verbatim.
-The agentic layer does **not** reinvent inference plumbing; it schedules it.
-
-### 4.3 Skill lifecycle
+The lifecycle, borrowed deliberately from ROS 2 actions (the pattern, not the
+dependency):
 
 ```text
-requested ──▶ can_run? ──no──▶ rejected (planner picks another skill)
-                 │yes
-                 ▼
-           controller(goal)
-                 │
-   RobotRuntime.swap_controller(controller)     ◀── the only execution mechanism
-                 │
-              RUNNING ──▶ SUCCEEDED   (success criterion met)
-                 │    ├──▶ FAILED      (unrecoverable; agent replans)
-                 │    └──▶ ABORTED     (agent preempts with a new goal)
-                 ▼
-           feedback() streamed to the planner throughout
+skill.start(goal, ctx) ── SkillExecution(PENDING)
+        │
+Dispatcher: runtime.run(action_source=execution.action_source)   ◀── the only execution mechanism
+        │
+     RUNNING ──▶ SUCCEEDED   success check met; source signals finished (§2.1 #3)
+        │    ├──▶ FAILED      unrecoverable; result() carries the evidence
+        │    └──▶ CANCELLED   agent called cancel(); dispatcher called runtime.stop()
+        ▼
+   feedback() readable throughout; result() blocks until terminal
 ```
 
-### 4.4 SkillRegistry — robot capabilities as callable tools
+### 5.4 How status actually flows (the thread seam)
+
+The `ActionSource` runs inside the runtime's tick thread; the agent polls the handle
+from its own thread. The connection is explicit and one-directional:
+
+```text
+runtime tick thread                          agent thread
+──────────────────────                       ─────────────────────
+source.update() ──▶ TickEvent/MetricsEvent ──▶ SkillExecution subscribes,
+                    (runtime event stream)      derives status/feedback
+                                                (+ its own SuccessCheck polls
+                                                 against WorldView)
+```
+
+The handle is a **consumer of the runtime event stream plus WorldView** — it never
+reaches into the loop, and the loop never knows the handle exists. Cancellation goes
+the other way through one sanctioned door: `cancel()` → dispatcher → `runtime.stop()`
+(§2.1 #1). No other cross-thread channel exists.
+
+### 5.5 SkillRegistry — robot capabilities as callable tools
 
 ```python
 class SkillRegistry:
     def register(self, skill: Skill) -> None: ...
     def resolve(self, goal: Goal, world: WorldView) -> Skill | None: ...
     def as_tools(self) -> list[ToolSpec]:
-        """Expose skills as tool schemas for an LLM/VLM agent to call."""
+        """Expose skills as tool schemas for the LLM/VLM agent (§6)."""
 ```
 
-`as_tools()` is what lets a general agent (e.g. a Qwen planner) call `navigate_to`, `pick`,
-and `place` as tools. The registry is the boundary between "the agent's tool vocabulary" and
-"the runtime's executable controllers".
+`as_tools()` derives each tool's schema from the skill's `goal_kinds`, params, and
+`description`. The registry is the boundary between "the agent's tool vocabulary" and
+"the runtime's executable sources".
 
 ---
 
-## 5. The Agent Loop
+## 6. The Agent: An Event-Driven Tool Loop
 
-The Agent is the deliberative process. It is **not** on a fixed rate and it **never blocks
-the control tick** — it runs in its own thread/process and communicates with `RobotRuntime`
-only through `swap_controller()` and by reading runtime telemetry.
+The Agent is deliberately **not** a bespoke planner framework. It is an LLM/VLM agent
+loop whose tools are the registered skills plus perception queries — the same shape as
+every working tool-using agent stack. Decomposition, recovery, and replanning are what
+the model does natively when a tool call returns `FAILED` with feedback; we do not
+encode them as `Plan` classes.
 
 ```python
 class Agent:
     def __init__(
         self,
-        planner: Planner,              # LLM/VLM: Goal + WorldView -> Plan (skill tree)
+        llm: AgentModel,                 # tool-calling LLM/VLM
         registry: SkillRegistry,
-        runtime: RobotRuntime,
-        world_view: WorldView,         # fused perception/state (see §7)
-        world_model: WorldModel | None = None,   # optional verification
+        dispatcher: SkillDispatcher,     # owns runtime.run()/stop(); one skill at a time
+        world_view: WorldView,
+        world_model: WorldModel | None = None,
     ) -> None: ...
 
-    def pursue(self, goal: Goal) -> GoalResult:
-        while not goal.success.met(self.world_view):
-            plan = self.planner.plan(goal, self.world_view)      # decompose
+    def submit(self, goal: Goal, *, priority: Priority = Priority.NORMAL) -> GoalHandle:
+        """Enqueue a goal. Non-blocking. Higher priority preempts the active skill."""
 
-            if self.world_model is not None:
-                plan = self._imagine_and_rank(plan)              # verify (§5.1)
-
-            skill = self.registry.resolve(plan.next_goal, self.world_view)
-            if skill is None or not skill.can_run(plan.next_goal, self.world_view):
-                if not self.planner.recover(plan, self.world_view):
-                    return GoalResult.FAILED
-                continue
-
-            self.runtime.swap_controller(skill.controller(plan.next_goal))   # dispatch
-            outcome = self._monitor(skill, plan.next_goal)                   # supervise
-
-            if outcome is SkillStatus.FAILED:
-                self.planner.observe_failure(skill, plan, self.world_view)   # replan next iter
-        return GoalResult.SUCCEEDED
+    def interrupt(self, event: Interrupt) -> None:
+        """Safety event, teleop takeover, user cancellation. Preempts immediately."""
 ```
 
-### 5.1 Imagine and verify (world-model in the loop)
+Structural rules:
+
+- **Event-driven, not a blocking `pursue()` loop.** Goals and interrupts arrive on a
+  queue at any time. A new high-priority goal or interrupt cancels the active
+  `SkillExecution` (§5.3) and enters deliberation. Teleop takeover is an interrupt
+  that dispatches `TeleopSkill` — first-class, not a special case.
+- **The tool loop is the planner.** Each deliberation step: the agent model sees the
+  task, a recent WorldView snapshot, and the transcript of prior skill results; it
+  calls a skill tool; the tool call blocks (from the model's perspective) on
+  `execution.result()`; the result — outcome, evidence, feedback — returns as the tool
+  result. Failure handling *is* the next model step.
+- **Perception queries are tools too.** `locate(object)`, `describe_scene()` — cheap
+  reads answered from WorldView, expensive ones dispatched as perceiver work. This
+  keeps "check before you act" inside the same tool vocabulary.
+- **The agent maintains task context.** What was tried, what failed and why, what the
+  scene looked like — this is the agent transcript plus WorldView snapshots at skill
+  boundaries. It is context for the model, not a persisted data structure.
+- **Deliberation never blocks the tick.** While the model thinks (seconds), the
+  runtime either runs the still-active skill or an idle/hold source. The dispatcher
+  guarantees the robot is always under *some* source's control or safely holding.
+
+### 6.1 Imagine and verify (world model in the loop)
+
+When a `WorldModel` is available, the agent uses it as one more tool:
 
 ```python
-def _imagine_and_rank(self, plan: Plan) -> Plan:
-    obs = self.runtime.robot.get_observation()
-    scored = []
-    for candidate in plan.candidates:                 # a few coarse alternatives
-        actions = self._sketch_actions(candidate)     # skill-level action sketch
-        traj = self.world_model.rollout(obs, actions) # pure, no hardware
-        scored.append((candidate, traj.score))
-    return plan.with_ranking(scored)                  # commit the best; keep the rest
+# exposed to the model as e.g. imagine(candidate_skill_calls) -> ranked outcomes
+def imagine(self, candidates: Sequence[SkillCall]) -> Sequence[ScoredOutcome]:
+    obs = self.world_view.snapshot_observation()
+    return [
+        ScoredOutcome(c, self.world_model.rollout(obs, self._sketch_actions(c)).score)
+        for c in candidates
+    ]
 ```
 
-This is the Qwen "imagine then act" pattern: roll a handful of coarse plans forward in the
-world model, rank, commit the best, and **verify on hardware/sim during execution** rather
-than trusting predicted pixels for contact-rich moments.
+This is the "imagine then act" pattern: roll a handful of coarse alternatives forward,
+rank, commit the best, and **verify during execution on hardware/sim** (via
+`SuccessCheck` and feedback) rather than trusting predicted pixels for contact-rich
+moments. The world model ranks; it never authorizes — §10.
 
-### 5.2 Monitoring and preemption
+### 6.2 The dispatcher
 
-`_monitor` polls `skill.status()` and `skill.feedback()` and watches `RobotRuntime`
-telemetry (the `TickEvent` / `LifecycleEvent` stream from Doc A). On success it returns; on
-failure it hands control back to the planner; on a higher-priority interrupt (new user goal,
-safety event) it preempts by swapping in a new controller. Preemption is just another
-`swap_controller()` — the runtime already supports thread-safe controller swap (Doc A §9).
+`SkillDispatcher` is the one component that touches the runtime. It serializes skill
+executions onto the single loop:
+
+```python
+class SkillDispatcher:
+    def dispatch(self, execution: SkillExecution) -> None:
+        """runtime.run(action_source=execution.action_source) on the runtime thread."""
+
+    def preempt(self) -> None:
+        """runtime.stop(); active execution → CANCELLED; robot holds."""
+```
+
+One runtime, one active execution, one place that calls `run()`/`stop()`. When
+gap-free skill transitions become necessary, hot-swap capability lands here without
+touching `Agent`, `Skill`, or the handles.
 
 ---
 
-## 6. Worked Example: A Qwen-RobotSuite-Style Pipeline
+## 7. The Data Flywheel
 
-Target: a general agent that navigates, manipulates, and uses a world model to plan — three
-specialized models composed behind one language interface.
+Recording is a **requirement of this layer, not a callback afterthought**. The
+strategic reason to run autonomy inside a training-centric stack is that every
+execution produces training data.
 
-```python
-# --- substrates -------------------------------------------------------------
-robot       = G1Robot(...)                         # Observable + Actuable
-world_model = RobotWorldModel.load("./exports/robot_world")   # WorldModel (rollout only)
+- Every `SkillExecution` is recorded as **one labeled episode**: the Doc A recording
+  stream (observations, actions, timing) plus this layer's labels — `goal.kind`,
+  `goal.params`, skill name, terminal status, `SuccessEstimate` evidence, and the
+  agent's dispatch context.
+- `SkillResult` carries a **reference to its recording**, so the agent transcript
+  links every decision to its data.
+- Failures are as valuable as successes: `FAILED` and `CANCELLED` episodes are
+  recorded with the same fidelity and labeled with the failure evidence.
+- The episode boundary **is** the execution boundary. No separate segmentation pass;
+  the seam that structures control also structures the dataset.
 
-# --- skills (each wraps a policy as a Controller) ---------------------------
-registry = SkillRegistry()
-registry.register(NavigateSkill(                   # RobotNav → waypoints → tracking Controller
-    policy=InferenceModel.load("./exports/robot_nav"),
-))
-registry.register(PickSkill(                       # RobotManip → PolicyController
-    policy=InferenceModel.load("./exports/robot_manip"),
-    execution=AsyncInferenceExecution(transport="process"),
-))
-registry.register(PlaceSkill(policy=InferenceModel.load("./exports/robot_manip")))
-
-# --- one reactive runtime ---------------------------------------------------
-runtime = RobotRuntime(
-    robot=robot,
-    controller=IdleController(),                   # replaced by the agent per skill
-    fps=30,
-    safety=G1SafetyLayer(),
-    callbacks=[RecordingCallback(...), TelemetryCallback(...)],
-)
-
-# --- one deliberative agent -------------------------------------------------
-agent = Agent(
-    planner=QwenPlanner(tools=registry.as_tools()),   # LLM/VLM, robot skills as tools
-    registry=registry,
-    runtime=runtime,
-    world_view=WorldView(...),                        # fused perception/state
-    world_model=world_model,                          # imagine + verify
-)
-
-with runtime:                                         # runtime loop on its own thread
-    agent.pursue(Goal(
-        kind="task",
-        params={"instruction": "find the green umbrella at the cafe and bring it to me"},
-        success=InstructionSatisfied(),
-    ))
-```
-
-What happens:
-
-1. `QwenPlanner` decomposes the instruction into child goals: `navigate_to(cafe)` →
-   `find(umbrella)` → `pick(umbrella)` → `navigate_to(user)` → `place(...)`.
-2. For branch points ("which approach to the umbrella?"), the agent rolls a few candidates
-   through `RobotWorldModel.rollout()` and commits the best.
-3. Each committed child goal resolves to a `Skill`, whose `Controller` is swapped into the
-   single `RobotRuntime`. RobotNav drives a waypoint-tracking controller; RobotManip drives a
-   `PolicyController`.
-4. The runtime records, applies safety, and streams telemetry the whole time — the same
-   machinery used for a plain policy rollout.
-5. If `PickSkill` reports `FAILED`, the planner observes the failure and replans (new
-   approach, or re-navigate) without ever stopping the runtime loop.
-
-`RobotRuntime` did not change. Studio's `RobotControlWorker` did not change. All agentic
-complexity lives in `Agent`, `Skill`, and the `WorldModel` — above the seam.
+This closes the loop back into Studio: autonomous operation → labeled episodes →
+policy improvement → better skills — without any additional instrumentation.
 
 ---
 
-## 7. CompositeController: Multi-Rate Effector Arbitration
+## 8. CompositeSource: Multi-Rate Effector Arbitration
 
-Some robots (humanoids, mobile manipulators) need several action-producing subsystems running
-**concurrently at different rates** and fused into one command per tick — VLA arms at ~20 Hz,
-locomotion at ~100–500 Hz, gaze at ~10 Hz. This is not a separate runtime and not the top of
-the hierarchy. It is **one `Controller` implementation**, `CompositeController`, that a
+Some robots (humanoids, mobile manipulators) need several action-producing subsystems
+running **concurrently at different rates**, fused into one command per tick — VLA arms
+at ~20 Hz, locomotion at ~100–500 Hz, gaze at ~10 Hz. This is not a separate runtime
+and not the top of the hierarchy. It is **one `ActionSource` implementation** that a
 `HumanoidSkill` installs like any other.
 
 ```python
-class CompositeController:                # implements Doc A's Controller protocol
+class CompositeSource:                    # implements Doc A's ActionSource protocol
     def __init__(
         self,
-        action_subsystems: Sequence[ActionSubsystem],   # produce effector-scoped fragments
-        info_subsystems: Sequence[InfoSubsystem] = (),   # perception/world/planner feeds
+        action_subsystems: Sequence[ActionSubsystem],   # effector-scoped fragments
+        info_subsystems: Sequence[InfoSubsystem] = (),   # perception/planner feeds
         arbiter: ActionArbiter = DefaultActionArbiter(),
         scheduler: SubsystemScheduler = CooperativeScheduler(),
     ) -> None: ...
 
-    def update(self, observation: Observation) -> RobotAction:
-        self._state.publish("observation", observation)
-        self._scheduler.tick(now())                       # runs 0..N subsystems this tick
+    def update(self, robot_state, camera_frames, step) -> np.ndarray:
+        self._state.publish("observation", (robot_state, camera_frames))
+        self._scheduler.tick(now())                     # runs 0..N subsystems this tick
         fragments = self._state.read_action_fragments()
-        return self._arbiter.merge(fragments, observation, now())
+        return self._arbiter.merge(fragments, robot_state, now())
 ```
 
-Internally it uses three mechanisms — all **implementation details of this one controller**,
+Internally it uses three mechanisms — all **implementation details of this one source**,
 not top-level architecture:
 
 - **Effector-scoped fragments.** Subsystems emit namespaced commands
-  (`{"left_arm": {...}, "base": {"twist": ...}}`) per
-  [`../robot-interface.md`](../robot-interface.md#namespaced-action-examples).
-- **Arbiter.** Merges fragments by priority + freshness + leases (single-writer effectors
-  like `base`), applying a per-effector degrade policy (`hold` / `safe` / `omit`) when a
-  fragment is stale or missing.
-- **Shared state + scheduler.** A typed, timestamped, in-process state cache (single writer
-  per key, latest-value-only) plus a cooperative scheduler that runs each subsystem at its
-  declared rate, with `execution="thread" | "process"` escape hatches for slow subsystems
-  (heavy VLA, world-model updates) so the control tick never blocks.
-
-```text
-CompositeController.update() tick:
-  publish observation
-  scheduler.tick(now)                      # perception, planner, vla, locomotion, gaze
-  fragments = read latest per subsystem
-  return arbiter.merge(fragments)          # priority + freshness + leases + degrade
-```
-
-An `ActionSubsystem` for arms may itself wrap a `PolicyController` + `InferenceExecution` +
-`ActionQueue`. Composite autonomy reuses the inference stack; it does not duplicate it.
-
-> The shared-state cache here is deliberately small and private. It is a mechanism for
-> fusing concurrent subsystems inside one controller — **not** a system-wide message bus and
-> **not** the interface between the Agent and the runtime. That interface is `Goal` / `Skill`
-> (§4). History and replay belong in the recording callback (Doc A §6), not this cache.
-
-### Subsystem protocols
+  (`{"left_arm": {...}, "base": {"twist": ...}}`); the arbiter flattens the merged
+  result to the robot's action vector at the seam (see the §3 note on the future
+  namespaced-action break).
+- **Arbiter.** Merges fragments by priority + freshness + leases (single-writer
+  effectors like `base`), applying a per-effector degrade policy
+  (`hold` / `safe` / `omit`) when a fragment is stale or missing.
+- **Scheduler + private state cache.** A cooperative scheduler runs each subsystem at
+  its declared rate, with `execution="thread" | "process"` escape hatches for slow
+  subsystems (heavy VLA, world-model updates) so the control tick never blocks. The
+  state cache is small and private — a fusion mechanism inside one source, **not** a
+  system-wide bus and **not** the Agent↔runtime interface (that is §5).
 
 ```python
 class RuntimeSubsystem(Protocol):
@@ -470,119 +584,156 @@ class RuntimeSubsystem(Protocol):
     def health(self) -> SubsystemHealth: ...
 
 class InfoSubsystem(RuntimeSubsystem, Protocol):
-    def step(self, ctx: SubsystemContext) -> None: ...          # writes state, no action
+    def step(self, ctx: SubsystemContext) -> None: ...            # writes state only
 
 class ActionSubsystem(RuntimeSubsystem, Protocol):
     effectors: frozenset[str]
     priority: int
-    def step(self, ctx: SubsystemContext) -> ActionFragment: ...  # effector-scoped command
+    def step(self, ctx: SubsystemContext) -> ActionFragment: ...  # effector-scoped
 ```
 
-Failure handling is local: a subsystem that raises or stalls is marked `DEGRADED` / `FAILED`
-and the arbiter applies that effector's degrade policy. The scheduler **never** kills the
-control loop — loop termination is `RobotRuntime`'s job (Doc A §8).
+An `ActionSubsystem` for arms may itself wrap a `PolicySource` + `Execution` +
+`ActionQueue`. Composite autonomy reuses the inference stack; it does not duplicate it.
+Failure handling is local: a subsystem that raises or stalls is marked
+`DEGRADED`/`FAILED` and the arbiter applies that effector's degrade policy. The
+scheduler never kills the control loop — loop termination is `RobotRuntime`'s job.
 
 ---
 
-## 8. Execution and Scaling
+## 9. Execution and Scaling
 
 The layer starts single-process and grows outward without changing the contracts:
 
-| Stage | Agent | World model | Skills / subsystems | State sharing |
-| ----- | ----- | ----------- | ------------------- | ------------- |
-| 1 (initial) | in-process thread | in-process | in-process controllers | in-process cache |
-| 2 | in-process thread | GPU worker process | `execution="process"` per heavy skill | in-process cache + IPC to workers |
-| 3 (future) | separate process/host | dedicated service | distributed subsystems | cross-process store (deferred) |
+| Stage | Agent | Perceivers / WorldView | World model | Skills / subsystems |
+| ----- | ----- | ---------------------- | ----------- | ------------------- |
+| 1 (initial) | in-process thread | in-process threads | in-process | in-process sources |
+| 2 | in-process thread | worker processes | GPU worker process | `execution="process"` per heavy skill |
+| 3 (future) | separate process/host | dedicated services | dedicated service | distributed subsystems |
 
-The contract that survives every stage: the Agent talks to `RobotRuntime` only through
-`Goal`/`Skill` + `swap_controller()`, and every substrate is `Observable`/`Actuable`/
-`WorldModel`. A 20B world model on its own GPU, a 4B VLA in a worker process, and locomotion
-behind a ROS 2 adapter can all coexist without the reactive loop learning about any of it.
+The contracts that survive every stage: the Agent talks to the runtime only through
+`SkillDispatcher` (`run()`/`stop()`), supervises only through `SkillExecution` handles
+and the event stream, and every substrate is `Observable`/`Actuable`/`WorldModel`.
+A 20B world model on its own GPU, a 4B VLA in a worker process, and vendor locomotion
+behind an adapter can all coexist without the reactive loop learning about any of it.
 
-Cross-process / cross-host state sharing is deferred until a concrete integration needs it
-(§11). Starting in-process is a deliberate simplification, not a ceiling.
+Cross-process/cross-host state sharing is deferred until a concrete integration needs
+it. Starting in-process is a deliberate simplification, not a ceiling.
 
 ---
 
-## 9. Safety Across Layers
+## 10. Safety Across Layers
 
-Safety is enforced at the **reactive** layer, always, regardless of what the agent decided:
+Safety is enforced at the **reactive** layer, always, regardless of what the agent
+decided:
 
 ```text
-controller.update() → callbacks.before_send_action → SafetyLayer.filter → robot.send_action
+source.update() → callback chain (on_action_ready) → SAFETY GATE → robot.send_action
 ```
 
-- The **Agent** resolves *intent* (which skill, which plan). It is not a safety authority.
-- The **arbiter** (inside `CompositeController`) resolves *conflicts* between subsystems. It
-  is not a safety authority.
-- **`SafetyLayer`** (Doc A) enforces *hard constraints* as the last gate before actuation. A
-  `SafetyViolationError` stops the loop no matter which controller produced the action.
+- The **Agent** resolves *intent* (which skill, which goal). Not a safety authority.
+- The **arbiter** (inside `CompositeSource`) resolves *conflicts* between subsystems.
+  Not a safety authority.
+- The **safety gate** (Doc A amendment §2.1 #4) enforces *hard constraints* as the
+  guaranteed-last transform before actuation — a dedicated slot, not an ordinary
+  callback whose position in the chain is a configuration accident. A safety violation
+  stops the loop no matter which source produced the action.
 
-This layering means a mis-planned goal or a mis-arbitrated fragment still cannot drive the
-robot outside its safety envelope. World-model verification (§5.1) is an *additional* upstream
-filter, never a replacement for `SafetyLayer`.
+This layering means a mis-planned goal, a hallucinated tool call, or a mis-arbitrated
+fragment still cannot drive the robot outside its safety envelope. World-model
+verification (§6.1) is an *additional* upstream filter, never a replacement for the
+gate. Interrupt-driven preemption (§6) adds a second reflex: safety events cancel the
+active skill at the agent level *and* the gate constrains actuation at the tick level.
 
 ---
 
-## 10. Prior Art
+## 11. Prior Art
 
 What to borrow, what to avoid.
 
 | System | Steal | Avoid |
 | ------ | ----- | ----- |
-| **Hierarchical VLA (System 2 / System 1)** | deliberative planner over reactive policy; language goals as the high-level interface | assuming one model does both jobs well |
-| **ROS 2 actions / services** | long-running goal lifecycle (propose → feedback → result); the `Goal`/`Skill` contract | mandatory `rclpy` dependency; ROS message types in core |
-| **Behavior trees (py_trees)** | tick/status model, skill-level arbitration | forcing every skill to be a BT node |
+| **Hierarchical VLA (System 2 / System 1)** | deliberative model over reactive policy; language as the high-level interface | assuming one model does both jobs well |
+| **ROS 2 actions** | goal → handle → feedback → result lifecycle; the `SkillExecution` pattern | mandatory `rclpy`; ROS message types in core |
+| **LLM tool-calling agents** | skills as tool schemas; transcript as task memory; failure-as-tool-result replanning | letting the model reach actuation without the typed Goal/Skill boundary |
+| **Behavior trees (py_trees)** | tick/status vocabulary for skill supervision | forcing every skill to be a BT node |
 | **Classic 3T / three-layer** | deliberator / sequencer / controller separation | rigid layer boundaries that forbid reactive shortcuts |
 | **Boston Dynamics SDK** | leases (single-writer effectors), e-stop, command authority | proprietary robot-specific assumptions |
-| **World-model planners (Dreamer-style, RobotWorld)** | imagine-and-rank before acting; world model as a ranking signal | closing the loop on predicted pixels for contact-rich control |
+| **World-model planners (Dreamer-style)** | imagine-and-rank before acting; world model as ranking signal | closing the loop on predicted pixels for contact-rich control |
 | **LeRobot** | robot/policy/dataset ergonomics, naming | using it as an autonomy architecture (it isn't one) |
 
-**ROS 2 verdict:** optional integration boundary, not the core runtime. Complex subsystems
-(vendor locomotion) enter as a `RuntimeSubsystem` adapter inside a `CompositeController`; the
-autonomy graph stays PhysicalAI-native.
+**ROS 2 verdict:** optional integration boundary, not the core runtime. Complex vendor
+subsystems (locomotion) enter as a `RuntimeSubsystem` adapter inside `CompositeSource`;
+the autonomy graph stays PhysicalAI-native.
 
 ---
 
-## 11. What This Doc Does NOT Define
+## 12. What This Doc Does NOT Define
 
 Deferred until a concrete need arises:
 
-- **Planner internals.** The `Planner` (LLM/VLM prompting, decomposition, recovery policy) is
-  a pluggable strategy, not fixed here.
+- **Agent model internals.** Prompting, context management, and model choice are
+  pluggable; only the tool boundary (`SkillRegistry.as_tools()`) is fixed.
+- **Perceiver implementations.** WorldView's contract is fixed (§4); which detectors,
+  captioners, or SLAM stacks feed it is per-integration.
 - **World-model training or interface details** beyond the `rollout()` contract.
-- **Typed `RobotAction` / `Effector` class hierarchy.** Use namespaced mappings
-  ([`../robot-interface.md`](../robot-interface.md)).
-- **Cross-process / cross-host state store.** Start in-process (§8).
+- **Typed action / effector class hierarchy.** Namespaced mappings inside
+  `CompositeSource`; flat vector at the robot seam until the substrate-wide break (§3).
+- **Cross-process / cross-host state store.** Start in-process (§9).
 - **A separate `AutonomyRuntime`.** Not introduced — one `RobotRuntime` loop with
-  controller-swap is sufficient. A separate runtime becomes warranted only for
-  PhysicalAI-owned multi-process subsystem lifecycles, a native ROS 2 graph that owns the
-  loop, or hard real-time scheduling in a non-Python control process. If that day comes,
-  `Skill`/`Controller` and `Goal` stay stable; only the executor beneath them changes.
-- **Composite manifest schema** beyond the per-effector sketch in Doc A's ecosystem.
-- **Real-time scheduling guarantees** from the Python scheduler. Time-critical control lives
-  in the `Robot` driver / vendor stack.
+  per-execution `run()` (and later hot-swap in the dispatcher) is sufficient. If a
+  natively multi-process or hard-real-time executor is ever warranted, `Goal` / `Skill`
+  / `SkillExecution` stay stable; only the dispatcher beneath them changes.
+- **Concurrent skills on disjoint effectors.** The v1 dispatcher runs one skill at a
+  time; the handle model already permits concurrency later without contract changes.
+- **Real-time scheduling guarantees** from the Python scheduler. Time-critical control
+  lives in the `Robot` driver / vendor stack.
 
 ---
 
-## 12. Decision Summary
+## 13. Implementation Sequencing
+
+When an agentic integration comes into scope, build in this order — each step is
+independently testable and de-risks the next:
+
+1. **Doc A amendments** (§2.1): `stop()`, per-run `action_source`, completion signal,
+   safety-gate slot. Small PRs against the runtime.
+2. **Scripted System 2 (no LLM).** A hardcoded skill sequence — e.g.
+   `navigate → pick → place` with fixed params — driven through `Skill` /
+   `SkillExecution` / `SkillDispatcher` on real hardware. This proves the entire seam
+   (dispatch, feedback, cancel, completion, recording) with zero model variance. **Do
+   not skip this step.**
+3. **WorldView + one cheap perceiver + one `SuccessCheck`.** Enough for real
+   preconditions and success detection on the scripted pipeline.
+4. **The LLM tool loop.** Replace the script with the agent model over
+   `registry.as_tools()`. The seam does not change.
+5. **World model as a tool** (§6.1), when a concrete model exists.
+6. **`CompositeSource`**, only when a humanoid / mobile manipulator is in scope.
+
+---
+
+## 14. Decision Summary
 
 ```text
-architecture                       dual-process: deliberative Agent (System 2) over reactive RobotRuntime (System 1)
-the seam                           Goal / Skill — long-running, with status + feedback (robot skills as callable tools)
-skill execution                    a Skill produces a Controller; Agent runs it via RobotRuntime.swap_controller()
-no new outer runtime               RobotRuntime stays the only control loop
-environment                        capability protocols: Observable / Actuable / Resettable / WorldModel
-real vs sim vs world model         same Observation/Action substrate; runtime needs only Observable+Actuable
-verification                       WorldModel.rollout() is pure; Agent imagines + ranks, verifies on hardware/sim
-multi-rate composite               CompositeController is ONE Controller (arbiter + effectors + scheduler inside)
-shared state                       private, in-process cache inside CompositeController — a mechanism, not the architecture
-safety                             enforced by SafetyLayer at the reactive layer, last gate before actuation
-scaling                            in-process → worker process → distributed, contracts unchanged
-implementation trigger             defer until a concrete agentic / composite-robot integration is in scope
+architecture                dual-process: event-driven Agent (System 2) over reactive RobotRuntime (System 1)
+the seam                    Goal / Skill / SkillExecution — dispatch returns a handle (status·feedback·cancel·result)
+skill execution             Skill.start(goal) → ActionSource + handle; dispatcher runs it via runtime.run(action_source=...)
+preemption                  handle.cancel() → dispatcher → runtime.stop(); interrupts are first-class agent inputs
+no new outer runtime        RobotRuntime stays the only control loop; per-execution run(), hot-swap deferred to dispatcher
+perception                  WorldView — named, owned, typed state cache; perceivers run at their own rates off-loop
+success                     SuccessCheck → SuccessEstimate (confidence + evidence); often a model call, never assumed free
+the planner                 an LLM tool loop over SkillRegistry.as_tools() — no bespoke Plan/recover framework
+environment                 capability protocols: Observable / Actuable / Resettable / WorldModel
+verification                WorldModel.rollout() is pure; imagine-and-rank is a tool; it ranks, never authorizes
+data flywheel               every SkillExecution = one labeled episode (goal, outcome, evidence) — a requirement
+multi-rate composite        CompositeSource is ONE ActionSource (arbiter + scheduler + private cache inside)
+safety                      dedicated final gate before actuation (Doc A amendment); agent and arbiter are not authorities
+scaling                     in-process → worker processes → distributed; contracts unchanged
+sequencing                  Doc A amendments → scripted agent → WorldView → LLM tool loop → world model → composite
+implementation trigger      defer until a concrete agentic / composite-robot integration is in scope
 ```
 
-This layer turns PhysicalAI from "run one policy on one robot" into "pursue a language goal
-by planning, imagining, and dispatching skills" — while keeping Doc A's small, predictable
-control loop completely intact. The agent plans; the world model imagines; skills execute as
-controllers; `RobotRuntime` runs the loop; `SafetyLayer` has the final say.
+This layer turns PhysicalAI from "run one policy on one robot" into "pursue a language
+goal by perceiving, deliberating, and dispatching skills" — while keeping Doc A's small,
+predictable control loop completely intact, and turning every autonomous minute into
+labeled training data. The agent deliberates; skills execute as action sources; handles
+supervise; `RobotRuntime` runs the loop; the safety gate has the final say.
