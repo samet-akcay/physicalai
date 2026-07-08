@@ -134,6 +134,17 @@ The layer must:
   per-subsystem worker escape hatches (§9).
 - Training the planner, world model, or policies. That is the Studio/training layer.
 
+### Naming and placement
+
+This layer lives in **`physicalai.autonomy`**, alongside `physicalai.runtime`. The
+pair reads as the architecture: *autonomy decides, runtime executes* —
+`physicalai.autonomy.Agent` dispatches `Skill`s onto
+`physicalai.runtime.RobotRuntime`. `RobotRuntime` keeps its name: "runtime" is the
+right word for the reactive substrate that all behavior (teleop, policy, skills)
+executes through. Terminology for the unit of execution: one completed `run()` is an
+**episode** (the recording/data-flywheel unit, §7); a *rollout* is specifically a
+policy-driven episode. Neither is a class name.
+
 ### 2.1 Prerequisites: small amendments to Doc A
 
 This layer requires four additions to the Doc A runtime. All are small, all are
@@ -518,7 +529,8 @@ Recording is a **requirement of this layer, not a callback afterthought**. The
 strategic reason to run autonomy inside a training-centric stack is that every
 execution produces training data.
 
-- Every `SkillExecution` is recorded as **one labeled episode**: the Doc A recording
+- Every `SkillExecution` is recorded as **one labeled episode** (one `run()` — the
+  unit of execution named in §2): the Doc A recording
   stream (observations, actions, timing) plus this layer's labels — `goal.kind`,
   `goal.params`, skill name, terminal status, `SuccessEstimate` evidence, and the
   agent's dispatch context.
@@ -715,6 +727,7 @@ independently testable and de-risks the next:
 
 ```text
 architecture                dual-process: event-driven Agent (System 2) over reactive RobotRuntime (System 1)
+naming                      System 2 = physicalai.autonomy, System 1 = physicalai.runtime; one run() = episode; rollout = policy-driven episode
 the seam                    Goal / Skill / SkillExecution — dispatch returns a handle (status·feedback·cancel·result)
 skill execution             Skill.start(goal) → ActionSource + handle; dispatcher runs it via runtime.run(action_source=...)
 preemption                  handle.cancel() → dispatcher → runtime.stop(); interrupts are first-class agent inputs
