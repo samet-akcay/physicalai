@@ -66,6 +66,23 @@ def _instantiate_recursive(value: object, *, depth: int = 0) -> object:
     return value
 
 
+def _check_value_depth(value: object, *, depth: int = 0) -> None:
+    """Preserve the legacy depth guard before handing typed values to a parser.
+
+    Raises:
+        ConfigError: If the value exceeds the configured nesting depth.
+    """
+    if depth > _MAX_CONFIG_DEPTH:
+        msg = f"Configuration nesting depth exceeds {_MAX_CONFIG_DEPTH}"
+        raise ConfigError(msg)
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _check_value_depth(item, depth=depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_value_depth(item, depth=depth + 1)
+
+
 def instantiate_obj_from_dict(
     config: ConfigMapping,
     *,
@@ -106,9 +123,15 @@ def instantiate_obj_from_dict(
             f"or pass target_cls explicitly. Got keys: {list(selected.keys())}"
         )
         raise ValueError(msg)
-    init_args = {name: _instantiate_recursive(value) for name, value in selected.items()}
-    args = init_args.pop("args", ())
-    return target_cls(*args, **init_args)
+    _check_value_depth(selected)
+    if "**kwargs" in str(target_cls.__init__):
+        init_args = {name: _instantiate_recursive(value) for name, value in selected.items()}
+        args = init_args.pop("args", ())
+        return target_cls(*args, **init_args)
+
+    from ._jsonargparse import parse_class_config  # ruff: ignore[PLC0415]
+
+    return parse_class_config(target_cls, selected)
 
 
 def instantiate_obj_from_pydantic(

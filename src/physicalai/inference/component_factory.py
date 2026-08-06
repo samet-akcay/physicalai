@@ -17,6 +17,8 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from physicalai.config import parse_class_config, validate_config
+
 from ._importing import import_dotted_path
 
 if TYPE_CHECKING:
@@ -174,11 +176,6 @@ def _import_class(class_path: str) -> type:
     return obj
 
 
-# Maximum nesting depth for recursive component instantiation.  Unbounded
-# recursion on a crafted manifest would exhaust the Python call stack.
-_MAX_COMPONENT_DEPTH = 10
-
-
 def instantiate_component(
     spec: ComponentSpec,
     *,
@@ -197,8 +194,8 @@ def instantiate_component(
 
     ``class_path`` takes precedence when both are present.
 
-    Nested ``ComponentSpec`` dicts in ``init_args`` are instantiated
-    recursively.
+    Nested typed component values are instantiated by jsonargparse according
+    to the resolved class constructor annotations.
 
     Args:
         spec: Component descriptor with type or class_path.
@@ -207,63 +204,32 @@ def instantiate_component(
 
     Returns:
         An instance of the resolved class.
-    """
-    return _instantiate_component(spec, registry=registry, _depth=0)
-
-
-def _instantiate_component(
-    spec: ComponentSpec,
-    *,
-    registry: ComponentRegistry | None = None,
-    _depth: int = 0,
-) -> object:
-    """Recursive implementation of :func:`instantiate_component`. Do not call directly.
-
-    Returns:
-        An instance of the resolved class.
 
     Raises:
-        ValueError: If the component nesting depth exceeds :data:`_MAX_COMPONENT_DEPTH`.
+        TypeError: If the resolved recipe does not describe a class recipe.
     """
-    if _depth >= _MAX_COMPONENT_DEPTH:
-        msg = (
-            f"Component nesting depth {_depth} exceeds the maximum allowed "
-            f"({_MAX_COMPONENT_DEPTH}). Check the manifest for deeply or "
-            "cyclically nested component specs."
-        )
-        raise ValueError(msg)
-
     reg = registry or component_registry
+    canonical = _canonical_spec(spec, registry=reg)
+    class_path = canonical["class_path"]
+    init_args = canonical["init_args"]
+    if not isinstance(class_path, str) or not isinstance(init_args, dict):
+        msg = "Resolved component spec is not a valid class recipe"
+        raise TypeError(msg)
+    cls_obj = _import_class(class_path)
+    return parse_class_config(cls_obj, init_args)
 
+
+def _canonical_spec(spec: ComponentSpec, *, registry: ComponentRegistry) -> dict[str, object]:
+    """Resolve aliases and normalize a manifest component to constructor args.
+
+    Returns:
+        A canonical ``class_path`` and ``init_args`` mapping.
+    """
     if spec.class_path:
-        resolved_path = reg.resolve(spec.class_path)
-        cls_obj = _import_class(resolved_path)
-
-        resolved_args: dict[str, object] = {}
-        for key, value in spec.init_args.items():
-            if isinstance(value, dict) and ("class_path" in value or "type" in value):
-                resolved_args[key] = _instantiate_component(
-                    type(spec).model_validate(value),
-                    registry=reg,
-                    _depth=_depth + 1,
-                )
-            else:
-                resolved_args[key] = value
-
-        return cls_obj(**resolved_args)
-
-    resolved_path = reg.resolve(spec.type)
-    cls_obj = _import_class(resolved_path)
-
-    resolved_params: dict[str, object] = {}
-    for key, value in spec.flat_params.items():
-        if isinstance(value, dict) and ("class_path" in value or "type" in value):
-            resolved_params[key] = _instantiate_component(
-                type(spec).model_validate(value),
-                registry=reg,
-                _depth=_depth + 1,
-            )
-        else:
-            resolved_params[key] = value
-
-    return cls_obj(**resolved_params)
+        class_path = registry.resolve(spec.class_path)
+        init_args = spec.init_args
+    else:
+        class_path = registry.resolve(spec.type)
+        init_args = spec.flat_params
+    validated = validate_config({"class_path": class_path, "init_args": dict(init_args)})
+    return {"class_path": validated["class_path"], "init_args": validated["init_args"]}

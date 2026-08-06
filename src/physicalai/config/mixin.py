@@ -69,7 +69,13 @@ class FromConfig:
             msg = f"Expected dataclass instance, got {type(config)}"
             raise TypeError(msg)
         values = cast("dict[str, Any]", dataclass_to_dict(config, recursive=recursive))
-        return cls.from_dict(values, key=key)
+        if key is not None:
+            nested = values.get(key)
+            if not isinstance(nested, Mapping):
+                msg = f"Configuration at key {key!r} must be a mapping"
+                raise TypeError(msg)
+            values = nested
+        return cls(**values)
 
     @classmethod
     def from_config(

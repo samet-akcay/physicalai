@@ -38,6 +38,12 @@ from ._export import (
     to_config,
 )
 from ._instantiate import instantiate as _strict_instantiate
+from ._jsonargparse import (
+    instantiate_known_config,
+    parse_class_config,
+    parse_class_config_file,
+    parse_component,
+)
 from ._normalize import validate_config
 from ._types import ConfigValue, JsonScalar, JsonValue
 from ._yaml import load_yaml, save_yaml, to_yaml
@@ -46,7 +52,7 @@ from .importing import import_dotted_path
 from .loading import import_class, instantiate_obj
 from .mixin import FromConfig, from_config
 
-instantiate = _strict_instantiate  # ruff: ignore[RUF067]
+instantiate = _strict_instantiate  # ruff: ignore[non-empty-init-module]
 
 __all__ = [
     "Config",
@@ -61,10 +67,14 @@ __all__ = [
     "import_class",
     "import_dotted_path",
     "instantiate",
+    "instantiate_known_config",
     "instantiate_obj",
     "is_config_exportable",
     "load_yaml",
     "normalize_config",
+    "parse_class_config",
+    "parse_class_config_file",
+    "parse_component",
     "resolve_public_class_path",
     "save_yaml",
     "to_config",

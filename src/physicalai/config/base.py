@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Literal, Self, cast, overload
 
 import yaml
 
-from .serializable import dataclass_to_dict, dict_to_dataclass
+from .serializable import dataclass_to_dict
 
 if TYPE_CHECKING:
     from ._types import JsonArgparseEnvelope, JsonValue
@@ -100,7 +100,15 @@ class Config:
         if not dataclasses.is_dataclass(cls):
             msg = f"{cls.__name__} must be a dataclass to use Config"
             raise TypeError(msg)
-        return dict_to_dataclass(cls, data, strict=strict)
+        if strict:
+            field_names = {field.name for field in dataclasses.fields(cls)}
+            extras = set(data) - field_names
+            if extras:
+                msg = f"Unexpected keys for {cls.__name__}: {sorted(extras)}"
+                raise TypeError(msg)
+        from ._jsonargparse import parse_class_config  # ruff: ignore[PLC0415]
+
+        return parse_class_config(cls, data)
 
     def instantiate(self) -> object:
         """Instantiate this direct construction recipe through the strict core.
@@ -153,8 +161,8 @@ class Config:
         target.write_text(yaml.safe_dump(data, default_flow_style=False, sort_keys=False), encoding="utf-8")
 
     @classmethod
-    def load(cls, path: str | Path) -> Self:
-        """Load a direct recipe or typed config from YAML.
+    def load(cls, source: Mapping[str, object] | str | Path) -> Self:
+        """Load a direct recipe or typed config from a mapping or YAML file.
 
         Returns:
             A reconstructed config instance.
@@ -163,24 +171,45 @@ class Config:
             ValueError: If the path extension is not ``.yaml`` or ``.yml``.
             TypeError: If the YAML root or ``init_args`` is not a mapping.
         """
-        source = Path(path)
-        if source.suffix not in {".yaml", ".yml"}:
-            msg = f"Unsupported file extension: {source.suffix}. Use .yaml or .yml"
+        if cls is Config:
+            if isinstance(source, Mapping):
+                return cls.from_dict(source)
+            source_path = Path(source)
+            if source_path.suffix not in {".yaml", ".yml"}:
+                msg = f"Unsupported file extension: {source_path.suffix}. Use .yaml or .yml"
+                raise ValueError(msg)
+            data = yaml.safe_load(source_path.read_text(encoding="utf-8")) or {}
+            if not isinstance(data, Mapping):
+                msg = f"Expected YAML root to be a mapping, got {type(data).__name__}"
+                raise TypeError(msg)
+            return cls.from_dict(data)
+
+        from ._jsonargparse import instantiate_known_config  # ruff: ignore[PLC0415]
+
+        if isinstance(source, Mapping):
+            values: Mapping[str, object] = source
+            if "init_args" in values:
+                inner = values["init_args"]
+                if inner is None or not isinstance(inner, Mapping):
+                    msg = "Expected 'init_args' to be a mapping"
+                    raise TypeError(msg)
+                values = inner
+            return instantiate_known_config(cls, values)
+
+        source_path = Path(source)
+        if source_path.suffix not in {".yaml", ".yml"}:
+            msg = f"Unsupported file extension: {source_path.suffix}. Use .yaml or .yml"
             raise ValueError(msg)
-        data = yaml.safe_load(source.read_text(encoding="utf-8"))
-        if data is None:
-            data = {}
+        data = yaml.safe_load(source_path.read_text(encoding="utf-8")) or {}
         if not isinstance(data, Mapping):
             msg = f"Expected YAML root to be a mapping, got {type(data).__name__}"
             raise TypeError(msg)
-        if cls is not Config and "init_args" in data:
+        if "init_args" in data:
             data = data["init_args"]
-            if data is None:
-                data = {}
             if not isinstance(data, Mapping):
-                msg = f"Expected 'init_args' to be a mapping, got {type(data).__name__}"
+                msg = "Expected 'init_args' to be a mapping"
                 raise TypeError(msg)
-        return cls.from_dict(data)
+        return instantiate_known_config(cls, data)
 
     @overload
     def __getitem__(self, key: Literal["class_path"]) -> str: ...
