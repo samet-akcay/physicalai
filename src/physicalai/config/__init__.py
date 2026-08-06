@@ -37,7 +37,7 @@ from ._export import (
     resolve_public_class_path,
     to_config,
 )
-from ._instantiate import instantiate as _strict_instantiate
+from ._instantiate import instantiate
 from ._jsonargparse import (
     instantiate_known_config,
     parse_class_config,
@@ -51,8 +51,6 @@ from .base import Config
 from .importing import import_dotted_path
 from .loading import import_class, instantiate_obj
 from .mixin import FromConfig, from_config
-
-instantiate = _strict_instantiate  # ruff: ignore[non-empty-init-module]
 
 __all__ = [
     "Config",

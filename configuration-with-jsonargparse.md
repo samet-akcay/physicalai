@@ -73,18 +73,18 @@ CLI / physicalai run
 
 The two paths implement substantially overlapping behavior:
 
-| Runtime utility behavior | Existing jsonargparse capability |
-| --- | --- |
-| Read YAML or dictionaries | `parse_path`, `parse_object` |
-| Inspect constructor signatures | `add_class_arguments` |
-| Apply typed defaults | Typed argument parsing and `defaults` policy |
-| Validate constructor arguments | Signature and type-hint validation |
-| Reject unknown arguments | Schema-aware parsing |
-| Reconstruct dataclasses | Dataclass argument support and instantiation |
-| Construct nested typed objects | Nested class and subclass arguments |
-| Select component subclasses | `add_subclass_arguments` |
-| Serialize parsed configuration | `dump`, `save` |
-| Use one schema for CLI and files | The same parser accepts both |
+| Runtime utility behavior         | Existing jsonargparse capability             |
+| -------------------------------- | -------------------------------------------- |
+| Read YAML or dictionaries        | `parse_path`, `parse_object`                 |
+| Inspect constructor signatures   | `add_class_arguments`                        |
+| Apply typed defaults             | Typed argument parsing and `defaults` policy |
+| Validate constructor arguments   | Signature and type-hint validation           |
+| Reject unknown arguments         | Schema-aware parsing                         |
+| Reconstruct dataclasses          | Dataclass argument support and instantiation |
+| Construct nested typed objects   | Nested class and subclass arguments          |
+| Select component subclasses      | `add_subclass_arguments`                     |
+| Serialize parsed configuration   | `dump`, `save`                               |
+| Use one schema for CLI and files | The same parser accepts both                 |
 
 Maintaining both implementations causes behavior to diverge. A configuration
 that succeeds through `physicalai run` may not behave identically through

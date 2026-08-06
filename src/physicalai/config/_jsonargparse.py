@@ -19,31 +19,18 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 
-def _enum_wire_values(value: object, annotation: object) -> object:  # ruff: ignore[too-many-return-statements]
+def _enum_wire_values(value: object, annotation: object) -> object:
     """Adapt existing value-based enum serialization to jsonargparse names.
 
     Returns:
         A value compatible with jsonargparse's enum handling.
     """
-    if value is None:
-        return None
     origin = get_origin(annotation)
     args = get_args(annotation)
     if origin in {UnionType, Union}:
-        for option in args:
-            if option is type(None):
-                continue
-            converted = _enum_wire_values(value, option)
-            if converted is not value:
-                return converted
-        return value
+        return _enum_union_value(value, args)
     if isinstance(annotation, type) and issubclass(annotation, Enum):
-        if isinstance(value, annotation):
-            return value.name
-        for member in annotation:
-            if member.value == value:
-                return member.name
-        return value
+        return _enum_value(value, annotation)
     if origin in {list, tuple, set} and isinstance(value, (list, tuple)):
         item_type = args[0] if args else object
         return [_enum_wire_values(item, item_type) for item in value]
@@ -59,6 +46,22 @@ def _enum_wire_values(value: object, annotation: object) -> object:  # ruff: ign
             for item in [value[field.name]]
         }
     return value
+
+
+def _enum_union_value(value: object, annotations: tuple[object, ...]) -> object:
+    for annotation in annotations:
+        if annotation is type(None):
+            continue
+        converted = _enum_wire_values(value, annotation)
+        if converted is not value:
+            return converted
+    return value
+
+
+def _enum_value(value: object, annotation: type[Enum]) -> object:
+    if isinstance(value, annotation):
+        return value.name
+    return next((member.name for member in annotation if member.value == value), value)
 
 
 def _parser_for_class(target: type[T], root: str) -> ArgumentParser:
