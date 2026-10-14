@@ -1,5 +1,5 @@
 ---
-name: pai-add-robot-integration
+name: add-robot-integration
 description: Adds or modifies a first-party robot integration in the Physical AI Runtime source tree. Use when implementing the Robot protocol under src/physicalai/robot, registering built-in drivers or optional extras, or changing verify.py and robot tests. DO NOT USE FOR running a policy with an existing robot (use pai-run-policy) or creating a third-party plugin in its own repository.
 license: Apache-2.0
 ---

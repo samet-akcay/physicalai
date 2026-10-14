@@ -18,6 +18,8 @@ _SCRIPT = "python3 .github/scripts/skills/agent_skills.py"
 
 _AUDIENCES = ("using", "contributing")
 _NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+# Published (using/) skills share a flat install namespace; repo-local ones do not.
+_PUBLISHED_PREFIX = "pai-"
 
 
 def repo_root() -> Path:
@@ -207,6 +209,10 @@ def cmd_validate(root: Path) -> int:
             if name in names:
                 errors.append(f"Duplicate canonical skill name: {name}")
             names.add(name)
+            if (audience == "using") != name.startswith(_PUBLISHED_PREFIX):
+                errors.append(
+                    f"{child}: using skills must start with {_PUBLISHED_PREFIX!r}; contributing skills must not",
+                )
             fm_name = frontmatter_name(skill_md)
             if not fm_name:
                 errors.append(f"{skill_md}: missing frontmatter name")
