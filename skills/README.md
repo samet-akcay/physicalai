@@ -1,6 +1,6 @@
 # Physical AI Runtime agent skills
 
-Runtime owns these canonical skills. **`skills/using/` is published to the OEP catalog; `skills/contributing/` stays in this repository.** A using skill must work with the installed Runtime package and a user's own project, without a Runtime source checkout. A contributing skill changes the Runtime implementation. A third-party robot plugin is external; a built-in driver under `src/physicalai/robot` is a contribution.
+Runtime owns these canonical skills. **`skills/using/` is the set intended for the OEP catalog; `skills/contributing/` stays in this repository.** A using skill must work with the installed Runtime package and a user's own project, without a Runtime source checkout. A contributing skill changes the Runtime implementation. A third-party robot plugin is external; a built-in driver under `src/physicalai/robot` is a contribution.
 
 | Audience     | Skill                                                                      | Workflow                                       |
 | ------------ | -------------------------------------------------------------------------- | ---------------------------------------------- |
@@ -15,7 +15,7 @@ Runtime owns these canonical skills. **`skills/using/` is published to the OEP c
 
 ## Discovery and authoring
 
-Canonical content is in `skills/<audience>/<name>/`. Both `.agents/skills/<name>` and `.claude/skills/<name>` are committed adapter symlinks, exposing **both audiences locally**; only `using/` is registered in the OEP catalog. Do not publish adapters as extra copies. Windows requires symlink support (Developer Mode or `core.symlinks true`); the sync script falls back to local junctions where available. After a rename, remove any stale junction reported by validation before rerunning sync.
+Canonical content is in `skills/<audience>/<name>/`. Both `.agents/skills/<name>` and `.claude/skills/<name>` are committed adapter symlinks, exposing **both audiences locally**; only `using/` is intended for the OEP catalog. Do not publish adapters as extra copies. Windows requires symlink support (Developer Mode or `core.symlinks true`); the sync script falls back to local junctions where available. After a rename, remove any stale junction reported by validation before rerunning sync.
 
 - Name skills with short, distinct actions; directory and frontmatter must match (`^[a-z0-9]+(-[a-z0-9]+)*$`, at most 64 characters). **Prefix `pai-` if and only if the skill is published:** `using/` names are installed into a flat, shared namespace next to other products' skills, so they carry the prefix and keep the same name in source and catalog. `contributing/` names never leave this repository and stay unprefixed (for example `add-camera-backend`). `agent_skills.py validate` enforces this; coordinate any `using/` rename with the OEP catalog.
 - Frontmatter uses portable `name`, `description`, and optional `license`; put future agent-specific information in `metadata:`. Describe what and when, and use a negative trigger to disambiguate neighboring skills.

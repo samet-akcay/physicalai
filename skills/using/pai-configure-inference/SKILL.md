@@ -37,7 +37,7 @@ Run a one-observation smoke inference in the user's project after each manifest 
 - Processor order matches training/export semantics (normalization before runner, denormalization after).
 - Artifact file names in manifests do not traverse paths (`..`, absolute paths).
 - A named `type` exists in the installed package; use `class_path` only for trusted local components.
-- Runner choice (`SinglePass`, chunking runners) stays consistent with `predict_action_chunk` vs `select_action` docs.
+- Runner is `single_pass` (`SinglePass`), the only built-in runner; do not invent other runner types. Its use stays consistent with the `predict_action_chunk` vs `select_action` docs.
 
 ## References
 

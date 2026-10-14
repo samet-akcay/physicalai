@@ -12,7 +12,7 @@ Runtime owns `src/physicalai/config/`. Studio consumes `Config`, `FromConfig`, a
 
 1. **Identify the API surface.** Use `Config` / `@export_config` for portable recipes; use jsonargparse for known, typed CLI construction. Read `docs/explanation/configuration.md` and a matching unit test before changing behavior.
    - Done when: the change is located in one owner and preserves existing recipes.
-2. **Implement with the trust boundary intact.** Only instantiate `class_path` from trusted local config. Keep the depth limit, artifact-path validation, and `ConfigError` messages precise. Do not introduce a generic loader that executes untrusted YAML.
+2. **Implement with the trust boundary intact.** Only instantiate `class_path` from trusted local config. Keep the depth limit and `ConfigError` messages precise; artifact-path validation belongs to inference manifest resolution, not `physicalai.config`. Do not introduce a generic loader that executes untrusted YAML.
    - Done when: accepted and rejected inputs have explicit outcomes.
 3. **Check downstream construction.** Round-trip an `@export_config` instance through `Config.from_instance(...).save()` and `instantiate()`; verify an existing Runtime YAML and Studio's use of `physicalai.config` still work.
    - Done when: round-trip and dependent construction tests pass without copying a config module into Studio.

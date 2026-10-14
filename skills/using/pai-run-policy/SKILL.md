@@ -22,7 +22,7 @@ license: Apache-2.0
 
    runtime = RobotRuntime(
        fps=30,
-       robot=SO101(port="/dev/ttyACM0"),
+       robot=SO101(port="/dev/ttyACM0", calibration="./calibration.json"),
        action_source=PolicySource(
            model=InferenceModel("./exports/act_policy"),
            execution=SyncExecution(),
