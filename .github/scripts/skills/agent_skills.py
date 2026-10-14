@@ -50,11 +50,13 @@ def read_link(path: Path) -> str | None:
 
 
 def managed_adapter(root: Path, link: Path) -> bool:
-    """Recognize only our generated symlinks or Windows junctions."""
-    target = read_link(link)
-    if target is not None:
-        return target.startswith("../../skills/")
-    if platform.system() != "Windows" or not link.is_dir():
+    """Recognize our generated symlinks (relative or absolute) or Windows junctions.
+
+    Returns:
+        True if the adapter points into the canonical ``skills/`` tree.
+    """
+    is_junction = platform.system() == "Windows" and link.is_dir() and not link.is_symlink()
+    if not link.is_symlink() and not is_junction:
         return False
     return link.resolve().is_relative_to((root / "skills").resolve())
 
@@ -92,14 +94,15 @@ def create_adapter(link: Path, target: str) -> None:
         raise RuntimeError(f"canonical skill missing: {abs_target}")
 
     if platform.system() == "Windows":
-        _create_windows_link(link, abs_target)
+        _create_windows_link(link, target, abs_target)
     else:
         link.symlink_to(target, target_is_directory=True)
 
 
-def _create_windows_link(link: Path, abs_target: Path) -> None:
+def _create_windows_link(link: Path, target: str, abs_target: Path) -> None:
+    # Use the same relative target as POSIX so validation and stale detection agree.
     try:
-        link.symlink_to(abs_target, target_is_directory=True)
+        link.symlink_to(target, target_is_directory=True)
     except OSError:
         # Local CI script, link/abs_target come from this repo's own
         # skills/ directory listing, not external input

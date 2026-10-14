@@ -16,7 +16,7 @@ Runtime owns built-in processors and runners under `src/physicalai/inference/`; 
    - Done when: it works on representative tensors without depending on a robot or network service.
 3. **Expose it to trusted manifests.** Register a short `type` with `ComponentRegistry` only when a stable built-in alias is useful. Otherwise require the existing `class_path` / `init_args` path. Keep nested specs under `_MAX_COMPONENT_DEPTH`.
    - Done when: `InferenceModel` can construct the component from a minimal local manifest.
-4. **Test order and compatibility.** Extend `tests/unit/inference/preprocessors/` or `postprocessors/` and `tests/unit/inference/test_manifest.py` as appropriate. Check preprocessor → runner → postprocessor order and preserve old manifest behavior.
+4. **Test order and compatibility.** Extend `tests/unit/inference/preprocessors/`, `postprocessors/`, or `tests/unit/inference/test_model.py` (runners), plus `tests/unit/inference/test_manifest.py`, as appropriate. Check preprocessor → runner → postprocessor order and preserve old manifest behavior.
    - Done when: focused tests pass and one fake-observation inference returns the expected action shape.
 5. **Document public additions** in `docs/reference/inference-api.md` or `docs/how-to/inference/configure-pre-post-processing.md`.
    - Done when: users can select the new type without reading source.
@@ -24,6 +24,6 @@ Runtime owns built-in processors and runners under `src/physicalai/inference/`; 
 ## Verify
 
 ```bash
-uv run pytest tests/unit/inference/preprocessors tests/unit/inference/postprocessors tests/unit/inference/test_manifest.py -q
+uv run pytest tests/unit/inference/preprocessors tests/unit/inference/postprocessors tests/unit/inference/test_model.py tests/unit/inference/test_manifest.py -q
 python3 .github/scripts/skills/agent_skills.py validate
 ```
