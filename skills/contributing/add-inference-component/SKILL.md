@@ -1,5 +1,5 @@
 ---
-name: pai-add-inference-component
+name: add-inference-component
 description: Adds a built-in preprocessor, postprocessor, or runner to Physical AI Runtime. Use when editing src/physicalai/inference component classes, ComponentRegistry, or their unit tests so a manifest can instantiate a new type. DO NOT USE FOR configuring an existing manifest in a customer project (use pai-configure-inference).
 license: Apache-2.0
 ---

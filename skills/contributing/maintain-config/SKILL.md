@@ -1,5 +1,5 @@
 ---
-name: pai-maintain-config
+name: maintain-config
 description: Maintains the Physical AI Runtime configuration package shared with Studio. Use when changing src/physicalai/config, export_config, Config serialization and instantiation, jsonargparse integration, or tests/unit/config. DO NOT USE FOR writing a trusted local runtime YAML recipe (use pai-configure-runtime).
 license: Apache-2.0
 ---

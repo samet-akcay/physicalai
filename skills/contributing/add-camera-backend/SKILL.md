@@ -1,5 +1,5 @@
 ---
-name: pai-add-camera-backend
+name: add-camera-backend
 description: Adds or modifies a camera backend in the Physical AI Runtime source tree. Use when implementing Camera, extending create_camera or discovery under src/physicalai/capture, adding optional vendor SDK extras, or writing capture tests with fake devices. DO NOT USE FOR configuring an existing camera in a runtime YAML recipe.
 license: Apache-2.0
 ---
