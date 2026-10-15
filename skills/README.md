@@ -2,16 +2,17 @@
 
 Runtime owns these canonical skills. **`skills/using/` is the set intended for the OEP catalog; `skills/contributing/` stays in this repository.** A using skill must work with the installed Runtime package and a user's own project, without a Runtime source checkout. A contributing skill changes the Runtime implementation. A third-party robot plugin is external; a built-in driver under `src/physicalai/robot` is a contribution.
 
-| Audience     | Skill                                                                      | Workflow                                       |
-| ------------ | -------------------------------------------------------------------------- | ---------------------------------------------- |
-| Using        | [`pai-load-policy`](using/pai-load-policy/SKILL.md)                        | Load Studio exports and Hub artifacts          |
-| Using        | [`pai-configure-inference`](using/pai-configure-inference/SKILL.md)        | Configure processors and runners in a manifest |
-| Using        | [`pai-configure-runtime`](using/pai-configure-runtime/SKILL.md)            | Author trusted local Runtime recipes           |
-| Using        | [`pai-run-policy`](using/pai-run-policy/SKILL.md)                          | Run an exported policy on a robot              |
-| Contributing | [`add-robot-integration`](contributing/add-robot-integration/SKILL.md)     | Add a built-in robot driver                    |
-| Contributing | [`add-camera-backend`](contributing/add-camera-backend/SKILL.md)           | Add a built-in camera backend                  |
-| Contributing | [`add-inference-component`](contributing/add-inference-component/SKILL.md) | Extend the inference component registry        |
-| Contributing | [`maintain-config`](contributing/maintain-config/SKILL.md)                 | Change the shared config implementation        |
+| Audience     | Skill                                                                      | Workflow                                         |
+| ------------ | -------------------------------------------------------------------------- | ------------------------------------------------ |
+| Using        | [`pai-load-policy`](using/pai-load-policy/SKILL.md)                        | Load Studio exports and Hub artifacts            |
+| Using        | [`pai-configure-inference`](using/pai-configure-inference/SKILL.md)        | Configure processors and runners in a manifest   |
+| Using        | [`pai-configure-runtime`](using/pai-configure-runtime/SKILL.md)            | Author trusted local Runtime recipes             |
+| Using        | [`pai-run-policy`](using/pai-run-policy/SKILL.md)                          | Run an exported policy on a robot                |
+| Using        | [`pai-create-robot-plugin`](using/pai-create-robot-plugin/SKILL.md)        | Develop and integrate a third-party robot plugin |
+| Contributing | [`add-robot-integration`](contributing/add-robot-integration/SKILL.md)     | Add a built-in robot driver                      |
+| Contributing | [`add-camera-backend`](contributing/add-camera-backend/SKILL.md)           | Add a built-in camera backend                    |
+| Contributing | [`add-inference-component`](contributing/add-inference-component/SKILL.md) | Extend the inference component registry          |
+| Contributing | [`maintain-config`](contributing/maintain-config/SKILL.md)                 | Change the shared config implementation          |
 
 ## Discovery and authoring
 

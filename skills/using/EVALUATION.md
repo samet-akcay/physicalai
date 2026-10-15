@@ -25,3 +25,10 @@ Run from an unrelated project with the Runtime package installed, not from a Run
 1. "Run an exported policy on SO-101 with a wrist UVC camera for 30 seconds." Expect the `physicalai run` config shape and a fake-hardware test before approval for real motion.
 2. "Choose an execution mode for chunked actions with low latency." Expect a reasoned Sync/Async/RTC selection without putting `fps` on AsyncExecution.
 3. "Simulate one tick with fake robot and fake policy." Expect `RobotRuntime` + `PolicySource` with no actual device access.
+
+## `pai-create-robot-plugin`
+
+1. "Create a serial follower robot plugin in my own package." Expect a Runtime protocol driver, SDK payload/entry point, fake-hardware tests, and backend catalog discovery.
+2. "Create a two-arm TCP plugin with follower and leader modes." Expect stable distinct catalog types, ordered joints, and no serial picker in the payload.
+3. "Add my plugin to the Studio Plugins page so I can install it from my local Studio checkout." Expect local backend integration and manifest guidance, with human review for curated-list inclusion.
+4. "Package URDF meshes for a Studio robot plugin and verify visualization." Expect packaged assets, a `RobotAsset`, tests, and the live URDF endpoint.
