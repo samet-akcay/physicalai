@@ -4,9 +4,9 @@
 
 ## 1. What is needed, and why?
 
-Training and inference integrations need to run framework code without installing its dependencies into the application interpreter. GR00T is one example: its Python/Transformers requirements differ from the host, and its OpenVINO enablement needs a separately patched environment.
+Some integrations need a separate interpreter/dependency set; others do not. The [LeRobot plugin][lerobot] already runs native training in a bundled, locked environment. [GR00T][gr00t] adds a pinned repository, patched OpenVINO environment, and persistent inference process. Their common infrastructure currently lives in `physicalai-train`, while GR00T's inference adapter also implements process management.
 
-The [GR00T prototype][gr00t] already demonstrates this with uv, but environment preparation lives in `physicalai-train`, while its inference adapter implements a separate process manager. Repeating that implementation per plugin increases maintenance and makes deployment depend on training infrastructure.
+The proposal shares existing infrastructure across these consumers and removes deployment's dependency on training. It does not require moving compatible first-party APIs into workers.
 
 The shared capability should provide:
 
@@ -16,6 +16,32 @@ The shared capability should provide:
 - Inference installation and operation **without `physicalai-train`**, for every framework, policy, or repository plugin that advertises inference.
 
 This is dependency/process isolation, **not a security sandbox**. It is not another dependency solver, training API, or robot scheduling strategy.
+
+### When would each consumer use this?
+
+| Consumer                                                        | Isolation need                                                       | Current or proposed behavior                                                                                                         |
+| --------------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| First-party `Trainer.fit(...)`                                  | None when dependencies are compatible                                | Keep Lightning training in-process; no environment preparation or API change.                                                        |
+| First-party exported ONNX/OpenVINO model                        | None when the backend/processors are compatible                      | Keep normal `InferenceModel` inference in-process.                                                                                   |
+| First-party policy or export tool with conflicting dependencies | Conditional, not a demonstrated requirement for all current policies | Opt in to a dedicated environment/job for that policy or toolchain; extras alone cannot install conflicting versions together.       |
+| LeRobot native training, [PR #10][lerobot]                      | Already implemented                                                  | Use the bundled project/lock and native device profile (CPU/CUDA/XPU); no repository patches required.                               |
+| LeRobot Runtime inference                                       | Depends on the selected policy/dependencies                          | Current adapter runs in-process. Use a persistent child only for an incompatible dependency set; that migration is not claimed here. |
+| GR00T native training and OpenVINO enablement                   | Already demonstrated in its prototype                                | Use upstream and patched project locks; inference retains a model in a child.                                                        |
+
+### First-party API: unchanged unless there is a concrete conflict
+
+```python
+# Normal first-party path: no isolation layer needed.
+trainer = Trainer(...)
+trainer.fit(policy, datamodule=data)
+with InferenceModel("exports/act-openvino") as model:
+    actions = model.predict_action_chunk(observation)
+
+# Optional future case: a policy/exporter needs an incompatible toolchain.
+policy_environment.run(entrypoint=first_party_job, args=["--config", recipe_path])
+```
+
+In the optional case, the job constructs Trainer/policy objects inside the child. A live Lightning Trainer, callbacks, and datamodule are not transparently moved across processes. The inspected first-party Transformers ranges overlap at `5.15.1`; that does not establish compatibility for every optional backend/device combination.
 
 ## 2. Proposed approach
 
@@ -27,7 +53,25 @@ Other package ───────┘      source + lock + process      uv / Pi
 
 The plugin owns native configs, model logic, preprocessing, export recipes, and artifact formats. The shared layer must not import Engine, inference models, or robot code. Construction/discovery performs no installation; preparation is explicit or occurs once at load, never per prediction.
 
-### Declare environments once in the plugin
+### LeRobot: a locked project, without repository patches
+
+```python
+# Pseudocode adapting the existing PR #10 flow.
+lerobot_environment = Environment(
+    source=BundledProject("plugin/env"),  # pyproject.toml + uv.lock
+    provider=Uv(lock="uv.lock", extras=worker_extras_for(config.policy.device)),
+)
+config.save_pretrained(config_dir)  # official LeRobot TrainPipelineConfig
+result = lerobot_environment.run(
+    entrypoint=lerobot_worker,
+    args=[f"--config_path={config_dir}/train_config.json"],
+    on_event=forward_training_progress,
+)
+```
+
+Keep native device selection and the host/worker config-version check from PR #10. This consumer reuses preparation, cache, logs, progress transport, cancellation, and shutdown; it does not need GR00T-specific patch or inference logic.
+
+### GR00T: a repository with an additional patch environment
 
 ```python
 # Pseudocode: plugin/environments.py
@@ -119,7 +163,7 @@ uv pip install "physicalai-train[gr00t]"
 uv pip install physicalai-gr00t-policy-plugin
 ```
 
-Each plugin owns its integration code, locks, workers, and patches/references. It reuses shared infrastructure rather than bundling a package manager or all framework/model assets. Training can be an optional extra. Host and inference-child dependencies must both satisfy the train-free requirement.
+Each plugin owns its integration code, locks, workers, and patches/references. It reuses shared infrastructure rather than bundling a package manager or all framework/model assets. Training can be an optional extra. Every inference plugin must satisfy the train-free requirement, but compatible in-process plugins need no isolation machinery.
 
 ## 3. Existing tools
 
@@ -158,13 +202,18 @@ If a library covers the required lifecycle, use it directly or through a small a
 
 ## 5. Proposed next steps and feedback
 
-1. **Evaluate before expanding:** compare uv, Pixi, and one execution library on the same persistent-worker test. Record how much code each replaces.
-2. **Extract only the common remainder:** share preparation and supervision below training and inference. Keep domain APIs in plugins. The layer can initially ship in Runtime; an independent monorepo library or lightweight InferenceKit base remains a packaging choice ([design context][packaging]).
-3. **Gate adoption on tests:** clean plugin installation without training, source/lock/patch verification, one model load per process, reset/close, bounded failure/cancellation, safe cache cleanup, read-only artifacts, offline operation, and the GR00T/Cosmos E2E regressions.
+**The case is a small extraction, not a platform built for hypothetical users:** LeRobot already needs locked native training; GR00T needs related preparation plus patching and deployment. First-party policies are not the sole justification, and isolation must not be imposed on them.
+
+1. **Evaluate before expanding:** compare uv, Pixi, and one execution library on the same workers. Record how much code each replaces.
+2. **Extract only proven common needs:** share preparation and supervision below training and inference. Keep domain APIs in consumers. Delay a separate distribution until independent consumers justify it ([packaging context][packaging]).
+3. **Gate adoption on both integrations:** preserve LeRobot native config/CLI behavior, progress/cancellation, and numerical regressions; preserve GR00T/Cosmos train/export/infer, patch verification, resident models, and reset/close. Check clean inference installs without training and unchanged first-party in-process behavior.
+
+If the extraction adds more policy/wrapper complexity than it removes, or an existing library meets the contract directly, do not maintain an additional general manager.
 
 For review: **Which tool can satisfy these needs with the least owned code? Which additional consumers or platform constraints should shape the contract? Does independent installation justify a separate distribution now?**
 
 [gr00t]: https://github.com/samet-akcay/physical-ai-studio/pull/23
+[lerobot]: https://github.com/samet-akcay/physical-ai-studio/pull/10
 [uv]: https://docs.astral.sh/uv/concepts/projects/sync/
 [pixi]: https://pixi.sh/latest/tutorials/multi_environment/
 [pixi-demo]: https://github.com/leoll2/pixi-demo
