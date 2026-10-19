@@ -4,9 +4,11 @@
 
 ## 1. What is needed, and why?
 
-Some integrations need a separate interpreter/dependency set; others do not. The [LeRobot plugin][lerobot] already runs native training in a bundled, locked environment. [GR00T][gr00t] adds a pinned repository, patched OpenVINO environment, and persistent inference process. Their common infrastructure currently lives in `physicalai-train`, while GR00T's inference adapter also implements process management.
+First-party policies originally used different Transformers versions; aligning them required implementation changes and testing. Their current common dependency range is a maintained constraint, not evidence that all policies naturally need the same versions. Separate policy/toolchain environments would allow independent upgrades instead of repeatedly adapting every implementation to one host dependency set.
 
-The proposal shares existing infrastructure across these consumers and removes deployment's dependency on training. It does not require moving compatible first-party APIs into workers.
+There are also existing plugin consumers: the [LeRobot plugin][lerobot] runs native training in a bundled, locked environment; [GR00T][gr00t] adds a pinned repository, patched OpenVINO environment, and persistent inference. Their common infrastructure currently lives in `physicalai-train`, while GR00T's inference adapter also implements process management.
+
+The proposal shares that infrastructure and removes deployment's dependency on training. Compatible first-party paths can remain in-process; policies that need different versions can use independently tested environments.
 
 The shared capability should provide:
 
@@ -19,29 +21,40 @@ This is dependency/process isolation, **not a security sandbox**. It is not anot
 
 ### When would each consumer use this?
 
-| Consumer                                                        | Isolation need                                                       | Current or proposed behavior                                                                                                         |
-| --------------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| First-party `Trainer.fit(...)`                                  | None when dependencies are compatible                                | Keep Lightning training in-process; no environment preparation or API change.                                                        |
-| First-party exported ONNX/OpenVINO model                        | None when the backend/processors are compatible                      | Keep normal `InferenceModel` inference in-process.                                                                                   |
-| First-party policy or export tool with conflicting dependencies | Conditional, not a demonstrated requirement for all current policies | Opt in to a dedicated environment/job for that policy or toolchain; extras alone cannot install conflicting versions together.       |
-| LeRobot native training, [PR #10][lerobot]                      | Already implemented                                                  | Use the bundled project/lock and native device profile (CPU/CUDA/XPU); no repository patches required.                               |
-| LeRobot Runtime inference                                       | Depends on the selected policy/dependencies                          | Current adapter runs in-process. Use a persistent child only for an incompatible dependency set; that migration is not claimed here. |
-| GR00T native training and OpenVINO enablement                   | Already demonstrated in its prototype                                | Use upstream and patched project locks; inference retains a model in a child.                                                        |
+| Consumer                                                   | Isolation need                                                   | Current or proposed behavior                                                                                                                                                        |
+| ---------------------------------------------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| First-party `Trainer.fit(...)`                             | Optional when its dependency set matches the current interpreter | Keep direct Lightning training in-process; isolation is not required for every call.                                                                                                |
+| First-party exported ONNX/OpenVINO model                   | None when the backend/processors are compatible                  | Keep normal `InferenceModel` inference in-process.                                                                                                                                  |
+| First-party policies with different native dependency sets | Avoid repeated cross-policy version alignment                    | Give each incompatible policy/toolchain a tested lock and child process; compatible policies can share an environment. This first-party path still needs implementation/validation. |
+| LeRobot native training, [PR #10][lerobot]                 | Already implemented                                              | Use the bundled project/lock and native device profile (CPU/CUDA/XPU); no repository patches required.                                                                              |
+| LeRobot Runtime inference                                  | Depends on the selected policy/dependencies                      | Current adapter runs in-process. Use a persistent child only for an incompatible dependency set; that migration is not claimed here.                                                |
+| GR00T native training and OpenVINO enablement              | Already demonstrated in its prototype                            | Use upstream and patched project locks; inference retains a model in a child.                                                                                                       |
 
-### First-party API: unchanged unless there is a concrete conflict
+### First-party policies: retain their own tested dependency sets
 
 ```python
-# Normal first-party path: no isolation layer needed.
-trainer = Trainer(...)
-trainer.fit(policy, datamodule=data)
-with InferenceModel("exports/act-openvino") as model:
-    actions = model.predict_action_chunk(observation)
-
-# Optional future case: a policy/exporter needs an incompatible toolchain.
-policy_environment.run(entrypoint=first_party_job, args=["--config", recipe_path])
+# Pseudocode: the two locks can require different Transformers/Torch versions.
+policy_a = Environment(
+    source=BundledProject("policies/a/env"),
+    provider=Uv(lock="uv.lock"),
+)
+policy_b = Environment(
+    source=BundledProject("policies/b/env"),
+    provider=Uv(lock="uv.lock"),
+)
+policy_a.run(entrypoint=first_party_job, args=["--config", recipe_a])
+policy_b.run(entrypoint=first_party_job, args=["--config", recipe_b])
 ```
 
-In the optional case, the job constructs Trainer/policy objects inside the child. A live Lightning Trainer, callbacks, and datamodule are not transparently moved across processes. The inspected first-party Transformers ranges overlap at `5.15.1`; that does not establish compatibility for every optional backend/device combination.
+```python
+# first_party_job.py: executed in the selected child's environment.
+trainer = Trainer(...)
+trainer.fit(policy, datamodule=data)
+```
+
+A direct `Trainer.fit(...)` remains available in a compatible interpreter. For isolation, launch the whole job and construct Trainer, policy, datamodule, and callbacks in the child; do not serialize live Lightning objects into another process. Exported ONNX/OpenVINO inference need not retain the original training environment unless its preprocessing or adapter requires those framework dependencies.
+
+**Packaging prerequisite:** process separation alone is insufficient if every child installs a package that still mandates one Transformers version. Move policy-specific requirements out of shared base dependencies and into the selected policy's extra/project. Runtime's mandatory Transformers requirement must also be optionalized or separated if its package is installed in a child needing another version. Do not install an all-policies extra in each child. Test shared Trainer/components against each lock: isolation removes the need to co-install versions, not framework API incompatibilities.
 
 ## 2. Proposed approach
 
@@ -202,11 +215,11 @@ If a library covers the required lifecycle, use it directly or through a small a
 
 ## 5. Proposed next steps and feedback
 
-**The case is a small extraction, not a platform built for hypothetical users:** LeRobot already needs locked native training; GR00T needs related preparation plus patching and deployment. First-party policies are not the sole justification, and isolation must not be imposed on them.
+**The case is shared infrastructure for three needs:** reducing first-party cross-policy dependency-alignment work, retaining LeRobot's native locked training, and supporting GR00T's source/patch/deployment environments. Reuse the plugin infrastructure first, then validate independently versioned first-party jobs; do not impose child processes on compatible calls.
 
 1. **Evaluate before expanding:** compare uv, Pixi, and one execution library on the same workers. Record how much code each replaces.
 2. **Extract only proven common needs:** share preparation and supervision below training and inference. Keep domain APIs in consumers. Delay a separate distribution until independent consumers justify it ([packaging context][packaging]).
-3. **Gate adoption on both integrations:** preserve LeRobot native config/CLI behavior, progress/cancellation, and numerical regressions; preserve GR00T/Cosmos train/export/infer, patch verification, resident models, and reset/close. Check clean inference installs without training and unchanged first-party in-process behavior.
+3. **Gate adoption on the consumers:** demonstrate two first-party jobs with genuinely incompatible dependency locks after the packaging changes; preserve direct Trainer behavior, LeRobot native config/CLI/progress/cancellation, and GR00T/Cosmos train/export/infer, patch verification, resident models, and reset/close. Check clean inference installs without training.
 
 If the extraction adds more policy/wrapper complexity than it removes, or an existing library meets the contract directly, do not maintain an additional general manager.
 
