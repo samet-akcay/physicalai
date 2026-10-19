@@ -1,6 +1,6 @@
 # Shared Isolation Layer for Python Plugins
 
-> **Discussion draft.** All APIs below are pseudocode. `physicalai.isolation` is a working import path; implementation, tooling, and distribution location remain open.
+> **Discussion draft.** Infrastructure APIs below are pseudocode. CLI/Trainer examples use existing public interfaces; automatic per-policy environment dispatch is proposed, not implemented. `physicalai.isolation` is a working import path; implementation, tooling, and distribution location remain open.
 
 ## 1. What is needed, and why?
 
@@ -30,29 +30,44 @@ This is dependency/process isolation, **not a security sandbox**. It is not anot
 | LeRobot Runtime inference                                  | Depends on the selected policy/dependencies                      | Current adapter runs in-process. Use a persistent child only for an incompatible dependency set; that migration is not claimed here.                                                |
 | GR00T native training and OpenVINO enablement              | Already demonstrated in its prototype                            | Use upstream and patched project locks; inference retains a model in a child.                                                                                                       |
 
-### First-party policies: retain their own tested dependency sets
+### First-party policies: preserve the public CLI and Python API
 
-```python
-# Pseudocode: the two locks can require different Transformers/Torch versions.
-policy_a = Environment(
-    source=BundledProject("policies/a/env"),
-    provider=Uv(lock="uv.lock"),
-)
-policy_b = Environment(
-    source=BundledProject("policies/b/env"),
-    provider=Uv(lock="uv.lock"),
-)
-policy_a.run(entrypoint=first_party_job, args=["--config", recipe_a])
-policy_b.run(entrypoint=first_party_job, args=["--config", recipe_b])
+Users keep the existing commands and configs, rather than calling environment objects:
+
+```bash
+# Existing commands; dependency-set selection behind them is a proposed extension.
+physicalai fit --config configs/physicalai/pi05/aloha/default.yaml
+physicalai fit --config configs/physicalai/smolvla/pusht/default.yaml
 ```
 
-```python
-# first_party_job.py: executed in the selected child's environment.
-trainer = Trainer(...)
-trainer.fit(policy, datamodule=data)
+The proposed CLI/Studio launcher performs the isolation internally:
+
+```text
+physicalai fit --config ...
+  → read the configured policy identifier before importing its implementation
+  → select the policy's package-maintained environment/lock
+  → if needed, invoke the same physicalai fit command in that environment
+  → build the existing policy, datamodule, callbacks, and Trainer there
+  → Trainer.fit(...), unchanged
 ```
 
-A direct `Trainer.fit(...)` remains available in a compatible interpreter. For isolation, launch the whole job and construct Trainer, policy, datamodule, and callbacks in the child; do not serialize live Lightning objects into another process. Exported ONNX/OpenVINO inference need not retain the original training environment unless its preprocessing or adapter requires those framework dependencies.
+An already compatible process takes the existing in-process path. A child verifies its selected environment and does not relaunch recursively. Selecting the profile before policy instantiation is required; the current first-party CLI does not yet implement this dispatch.
+
+Python users retain the same code, run with the appropriate policy interpreter:
+
+```python
+# train.py, executed in the SmolVLA environment; ordinary first-party API.
+from physicalai.data import LeRobotDataModule
+from physicalai.policies import SmolVLA
+from physicalai.train import Trainer
+
+model = SmolVLA()
+data = LeRobotDataModule(repo_id="lerobot/pusht")
+trainer = Trainer(max_steps=1000, accelerator="gpu", devices=1)
+trainer.fit(model=model, datamodule=data)
+```
+
+A script using Pi05 instead runs in Pi05's environment if their dependencies differ. A live Trainer, model, datamodule, or arbitrary callback cannot be constructed in one interpreter and transparently migrated by `fit()`. Launch the script/job first. The isolation subpackage supplies private launcher mechanics, not a replacement training API. Exported ONNX/OpenVINO inference need not retain the training environment unless its adapter/processors require it.
 
 **Packaging prerequisite:** process separation alone is insufficient if every child installs a package that still mandates one Transformers version. Move policy-specific requirements out of shared base dependencies and into the selected policy's extra/project. Runtime's mandatory Transformers requirement must also be optionalized or separated if its package is installed in a child needing another version. Do not install an all-policies extra in each child. Test shared Trainer/components against each lock: isolation removes the need to co-install versions, not framework API incompatibilities.
 
