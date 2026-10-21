@@ -1,131 +1,54 @@
-# Shared Isolation Layer: Objects and Integration Flows
+# Shared Isolation Layer: User Flows and Implementation Boundaries
 
-> **Discussion draft.** Infrastructure code below is pseudocode, not a released API. Public CLI/Trainer examples use existing interfaces. `physicalai.isolation` is a working name; tool and distribution choices remain open.
+> **Discussion draft.** Public examples reflect the linked POCs; internal examples are proposed pseudocode. `Environment`, `Provider`, and `Session` are not released shared APIs. Code location is identified for each example. No new end-user environment API is required.
 
-## 1. Problem and requirements
+## 1. Problem: incompatible dependencies in one application
 
-| Consumer                  | Need                                                                                                                                             |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| First-party policies      | Retain separately tested Transformers/Torch versions instead of adapting every policy to one dependency set. Compatible calls remain in-process. |
-| [LeRobot plugin][lerobot] | Reuse its existing locked native-training environment, config serialization, progress, and cancellation. No source patches are required.         |
-| [GR00T plugin][gr00t]     | Prepare upstream and patched OpenVINO environments; retain a loaded model in an isolated inference process.                                      |
+First-party policies originally required different Transformers versions. Maintaining a common version required porting and testing. Framework/repository integrations add their own Python, Torch, and native-library requirements.
 
-The proposal shares existing infrastructure rather than implementing another solver or training API. Every plugin advertising inference must deploy without `physicalai-train` in the host or inference child.
+Separate interpreters permit independent dependency sets:
 
 ```text
-Required: reviewed source + authoritative lock + managed process + bounded messages
-Not required: one environment per policy, a new public training API, or a custom package manager
+Application interpreter (host)
+  ├── child A: policy/framework A + its tested lock
+  └── child B: policy/framework B + its tested lock
 ```
 
-Dependency/process isolation is not a security sandbox. Framework code retains the operator's privileges.
+The child owns model/framework imports. The host selects a job or sends observations; it does not import both incompatible stacks. Compatible first-party training and exported-model inference can remain in-process.
 
-## 2. Object architecture
+Two existing consumers motivate shared infrastructure: [LeRobot PR #10][lerobot] has locked native-training workers; [GR00T PR #23][gr00t] adds Git/patch preparation and persistent inference. Preparation currently lives in `physicalai-train`, which is unsuitable as a deployment prerequisite.
 
-Arrows indicate use, not imports into the shared layer. In-process consumers bypass this layer.
+## 2. Existing starting point: the Pixi demonstration
 
-```mermaid
-flowchart LR
-    Engine["CLI / Studio runner / Engine"] -->|isolated job| Env
-    Adapter["RuntimeAdapter"] -->|isolated inference| Env
-    Other["Other package"] --> Env
-
-    subgraph Shared["Shared isolation layer: proposed extraction"]
-        Env["Environment: lazy public handle"] --> Source["ProjectSource: bundled or Git"]
-        Source -->|optional| Patches["PatchSeries: published or bundled"]
-        Env --> Provider["Provider: prepare or attach"]
-        Provider --> Prepared["PreparedEnvironment: internal launch context"]
-        Env -->|run or start| Session["Session: child and channels"]
-        Prepared --> Session
-    end
-
-    Provider --> Tool["uv / Pixi / external library"]
-    Session -.->|can also delegate| Tool
-    Session <-->|versioned messages| Bridge["Worker-side bridge"]
-    Bridge --> Native["Native trainer / exporter / inference model"]
-```
-
-### Existing objects and proposed changes
-
-“Existing” means available in Runtime or the linked Studio POCs, not necessarily merged or generally validated.
-
-| Object                                          | Status                             | Responsibility / change                                                                                                          |
-| ----------------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `Engine`, `TrainingEngine`, `Trainer`           | Studio / POCs                      | Own training APIs, policy selection, hooks, and results. Remain outside the shared layer.                                        |
-| `InferenceModel`, `RuntimeAdapter`              | Runtime                            | Own inference API, artifact loading, model operations, and close lifecycle. Remain outside.                                      |
-| `ProjectSource`, `BundledProject`, `GitProject` | Studio PR #23                      | Materialize reviewed source. Reuse in shared code.                                                                               |
-| `PublishedPatches`, `BundledPatches`            | Studio PR #23                      | Apply ordered patch layers; verify digests/resulting tree and record provenance.                                                 |
-| `WorkerEnv`                                     | Studio POCs                        | Current environment declaration. Source/dependency settings move behind the shared interface.                                    |
-| `PreparedEnvironment`                           | Studio POCs                        | Resolved paths/cache identity. Keep internal; extend launch data for provider activation if needed.                              |
-| `Environment`                                   | Proposed facade                    | Prepare, run a finite job, or start a persistent session. No I/O during construction.                                            |
-| `Provider` / `Uv`                               | Interface proposed; uv calls exist | Delegate installation/activation to the selected tool; support validated existing interpreters.                                  |
-| `Session` and bridge                            | Common interface proposed          | Consolidate Engine supervision and GR00T's `_Worker`/numeric protocol. Own channels, deadlines, and cleanup—not model semantics. |
-
-### Environment and process are different objects
+The [Pixi demo][pixi-demo] is an independent object-detection example, not a Physical AI plugin. Its `pixi.toml` defines separate Python/dependency environments; `main.py` invokes tasks and exchanges files:
 
 ```text
-One environment / tested lock
-    ├── Session 1: finite training job → exit
-    ├── Session 2: finite export job   → exit
-    └── Session 3: persistent model   → predict, predict, reset, close
-
-Environment lifetime: cached and reusable
-Session lifetime: one owned child process
+main.py
+  → pixi run preprocess       → preprocessed.jpg
+  → pixi run detect-yolo     → detections.json
+  → pixi run annotate        → annotated.jpg
 ```
 
-```python
-# Pseudocode: callers need not manage a second prepared-state object.
-class Environment:
-    def __init__(self, source, provider, profile=None):
-        self.source, self.provider, self.profile = source, provider, profile
+This demonstrates environment selection. Our inference case additionally needs one child that loads a model once and serves repeated requests. The question is what existing tools can supply and what integration code remains—not whether to write another package manager.
 
-    def prepare(self, offline=False):
-        self._prepared = cache.prepare_or_reuse(
-            source=self.source, provider=self.provider,
-            profile=self.profile, offline=offline,
-        )  # validates inputs; stages source; consumes the lock; records identity
-        return self
+## 3. What users install and call
 
-    def start(self, entrypoint, args=(), **deadlines):
-        self.prepare()
-        return Session.launch(self._prepared, entrypoint, args, **deadlines)
-
-    def run(self, entrypoint, args=(), on_event=None):
-        with self.start(entrypoint, args) as session:
-            return session.wait(on_event=on_event)  # generic completion/events
-```
-
-Providers return executable/command, working directory, and activation context—not necessarily just a Python path. Model assets have separate revisions. Warm reuse must not resynchronize dependencies per prediction; source/lock/profile/provider/platform changes require identity validation.
-
-## 3. Integration flows
+These examples assume the relevant development branch/dependencies are installed. The isolated first-party dispatcher is proposed; the LeRobot/GR00T examples describe their POCs, not published releases.
 
 ### 3.1 First-party CLI and Python API
 
-Users keep existing commands and configs:
+**User terminal, from Studio's `library/`:**
 
 ```bash
 physicalai fit --config configs/physicalai/pi05/aloha/default.yaml
 physicalai fit --config configs/physicalai/smolvla/pusht/default.yaml
 ```
 
-**Proposed internal dispatch, not implemented today:**
+The proposed dispatcher chooses the configured policy's environment before importing it. In that interpreter, the existing config parser builds Trainer/model/data objects. Command names, configs, and overrides remain the same. Its location and caller are shown in [Section 4.1](#41-who-calls-dispatch_fit).
+
+**User-owned `train.py`, run in the selected policy interpreter:**
 
 ```python
-# CLI/Studio internals: before importing a policy or building live objects.
-def dispatch_fit(argv):
-    config = read_training_recipe(argv)
-    environment = policy_metadata.environment_for(config.model.class_path)
-    if environment is None or verified_current_environment(environment):
-        return existing_fit_handler(argv)
-    completion = environment.run(entrypoint=fit_worker, args=argv)
-    return completion.exit_code
-
-# fit_worker uses the existing handler in the selected environment; no redispatch loop.
-```
-
-The Python API runs unchanged in the selected interpreter:
-
-```python
-# train.py: ordinary first-party API, e.g. in the SmolVLA environment.
 from physicalai.data import LeRobotDataModule
 from physicalai.policies import SmolVLA
 from physicalai.train import Trainer
@@ -135,99 +58,201 @@ data = LeRobotDataModule(repo_id="lerobot/pusht")
 Trainer(max_steps=1000, accelerator="gpu", devices=1).fit(model, datamodule=data)
 ```
 
-Launch the script/job before constructing its objects; `fit()` does not migrate a live model, datamodule, or callbacks between interpreters. Different dependency sets also require packaging changes: policy-specific requirements cannot remain globally imposed by shared base packages. This includes Runtime's mandatory Transformers dependency when a child needs another version. Do not install an all-policies extra in every child.
+Direct Python calls remain in-process. `fit()` does not move an already constructed model or arbitrary callbacks into another interpreter. Isolation happens when launching the script/job.
 
-### 3.2 LeRobot: bundled project, native config
+### 3.2 LeRobot: official config or native CLI flags
+
+**User Python code:**
 
 ```python
-# User: existing Engine API and official LeRobot TrainPipelineConfig.
-engine = Engine.create("lerobot")
-run = engine.train(config)
+from lerobot.configs.default import DatasetConfig
+from lerobot.configs.train import TrainPipelineConfig
+from lerobot.policies.act.configuration_act import ACTConfig
+from physicalai.engine import Engine
+
+config = TrainPipelineConfig(
+    dataset=DatasetConfig(repo_id="lerobot/pusht"),
+    policy=ACTConfig(device="cuda", push_to_hub=False),
+    steps=1000,
+)
+run = Engine.create("lerobot").train(config)
 ```
 
-```python
-# Plugin internals: proposed common facade over PR #10's existing flow.
-environment = Environment(
-    source=BundledProject(plugin_files / "env"),  # pyproject.toml + uv.lock
-    provider=Uv(lock="uv.lock", extras=worker_extras_for(config.policy.device)),
-)
-config.save_pretrained(config_dir)
-completion = environment.run(
-    entrypoint=lerobot_worker,
-    args=[f"--config_path={config_dir}/train_config.json"],
-    on_event=forward_training_progress,
-)
-run = translate_to_engine_run(completion)
+`TrainPipelineConfig` is LeRobot's class. The plugin serializes it and verifies that host/worker LeRobot versions match. CLI users replace the `lerobot-train` prefix with `physicalai train lerobot`; native flags, help, and exit status pass through. No user creates `Environment` objects; that code belongs in the plugin ([Section 4.2](#42-where-does-lerobot-create-and-use-an-environment)).
+
+### 3.3 GR00T: native CLI training, common export/inference API
+
+**User terminal:** the flags belong to upstream `gr00t/experiment/launch_finetune.py`:
+
+```bash
+physicalai train gr00t --base-model-path nvidia/GR00T-N1.7-3B \
+  --dataset-path /data/libero_demo --embodiment-tag LIBERO_PANDA \
+  --output-dir runs/gr00t
 ```
 
-Native config-version checks and device selection remain LeRobot integration responsibilities. The current LeRobot Runtime adapter is in-process; persistent inference is needed only for an incompatible dependency set.
-
-### 3.3 GR00T: repository and patch enablement
+**User Python code after training:**
 
 ```python
-# Plugin-owned declarations; names/signatures are illustrative.
-native = Environment(
-    source=GitProject(UPSTREAM_REPOSITORY, revision=PINNED_COMMIT),
+from physicalai.engine import Engine
+from physicalai.inference import InferenceModel
+
+package = Engine.create("gr00t").export(
+    "runs/gr00t", "exports/gr00t-openvino", backend="openvino",
+)
+with InferenceModel(package) as model:
+    actions = model.predict_action_chunk({
+        "images": {"image": front_rgb, "wrist_image": wrist_rgb},  # HWC uint8 RGB
+        "state": state_vector,  # flat state, per dataset modality mapping
+        "task": "put the white mug on the plate",
+    })
+```
+
+**What is and is not native:**
+
+| Operation            | Contract                                                                                                                                                                                                                       |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Training CLI         | Same upstream flags and launcher, different command prefix.                                                                                                                                                                    |
+| Training Python API  | Current `Gr00tEngine.train()` accepts native argument tokens or a plugin-owned convenience config. NVIDIA's `FinetuneConfig` object is **not yet supported directly**; native-config interoperability is a separate follow-up. |
+| Export               | Engine calls the Suite exporter and adds a Runtime package.                                                                                                                                                                    |
+| Deployment inference | Common `InferenceModel` API, intentionally not an alias for `Gr00tPolicy.get_action()`. The worker retains GR00T preprocessing/inference/postprocessing.                                                                       |
+
+Native repository APIs remain usable within their own environment. Sharing isolation infrastructure does not expose arbitrary native Python objects in the host. The plugin's implementation is shown in [Section 4.3](#43-where-does-gr00t-select-native-versus-patched-execution). GR00T needs CUDA and Cosmos license access; dataset/camera/state mapping must match the checkpoint.
+
+## 4. Where the implementation belongs
+
+The following paths identify ownership, not a requirement to publish another package. **Runtime** is the `physicalai` repository; **Studio** is `physical-ai-studio`.
+
+| Component                       | Location                                                                | Status / role                                                                                                                                              |
+| ------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Shared isolation implementation | Runtime `src/physicalai/isolation/` (working location)                  | Proposed extraction: preparation, source/patch checks, process lifetime, protocol. No Engine/model imports.                                                |
+| First-party CLI integration     | Studio `library/src/physicalai/cli/`                                    | Existing public command; new private pre-dispatch helper/worker needed.                                                                                    |
+| LeRobot integration             | Studio `plugins/policies/lerobot/src/physicalai_lerobot_policy_plugin/` | Existing Engine/worker; environment declaration would move to a new `environments.py`.                                                                     |
+| GR00T integration               | Studio `plugins/policies/gr00t/src/physicalai_gr00t_policy_plugin/`     | Existing `environments.py`, `engine.py`, `package.py`, `runtime.py`, and `_worker/` scripts. Replace duplicated infrastructure, not native model behavior. |
+
+### 4.1 Who calls `dispatch_fit`?
+
+This is **not** a user API or an existing helper. Its proposed call chain is:
+
+```text
+Runtime cli/main.py
+  → optional selected-command pre_dispatch(raw_argv) hook [new]
+    → Studio cli/fit.py: pre_dispatch(argv) [new]
+      → Studio cli/_isolation.py: dispatch_fit(argv) [new]
+        ├── compatible: return None → existing parser/dispatch
+        └── otherwise: launch cli/_fit_worker.py [new] in selected environment
+              → existing fit.build_parser() and fit.run()
+              → Trainer.fit(...)
+```
+
+Runtime must call this hook **before** `_load_spec()` builds the full parser; adding a helper after model imports would be too late. This is new CLI orchestration work, not behavior supplied by `Environment` alone.
+
+**Proposed Studio `library/src/physicalai/cli/fit.py`:**
+
+```python
+def pre_dispatch(argv):
+    from ._isolation import dispatch_fit
+    return dispatch_fit(argv)
+```
+
+**Proposed Studio `library/src/physicalai/cli/_isolation.py`:**
+
+```python
+def dispatch_fit(argv):
+    # Resolve policy selection and overrides without importing model classes.
+    policy_id = read_policy_selection(argv)
+    env = policy_profiles.get(policy_id)  # package-maintained metadata
+    if env is None or verified_current_environment(env):
+        return None  # host continues its existing parser/handler
+    return env.run(entrypoint=FIT_WORKER, args=argv).exit_code
+```
+
+`FIT_WORKER` is the new private `_fit_worker.py`, whose body invokes the existing parser/handler directly, avoiding recursive dispatch. Config composition, overrides, help, and resume behavior must be preserved.
+
+**Packaging prerequisite:** put each policy's requirements in its own extra/lock, not an all-policies base. Shared training/Runtime packages must not force a conflicting Transformers version into every child. Runtime's current mandatory Transformers dependency needs optionalization/separation for workers requiring another version; the shared code still needs testing against each lock.
+
+### 4.2 Where does LeRobot create and use an environment?
+
+Paths below are relative to the **LeRobot integration directory** listed above. These are internal migration sketches, not additional user code.
+
+**`environments.py` — proposed new file; replaces the declaration currently in `engine.py`:**
+
+```python
+def training_environment(device):
+    return Environment(
+        source=BundledProject(plugin_files / "env"),  # existing project + lock
+        provider=Uv(lock="uv.lock", extras=worker_extras_for(device)),
+    )
+```
+
+**`engine.py` — inside the existing `LeRobotEngine.train` method:**
+
+```python
+class LeRobotEngine(TrainingEngine):
+    def train(self, config):
+        verify_host_worker_config_version(config)
+        env = training_environment(config.policy.device)
+        with temporary_config_directory() as directory:
+            config.save_pretrained(directory)
+            job = env.run(
+                entrypoint=plugin_files / "_worker.py",
+                args=[f"--config_path={directory}/train_config.json"],
+                on_event=forward_training_progress,
+            )
+        return to_engine_run(job.payload)
+```
+
+Existing `_worker.py` invokes LeRobot's native trainer. Device/profile choice and config serialization stay with this plugin. Its current Runtime adapter is in-process; moving that adapter to a child is only needed for an incompatible dependency set.
+
+### 4.3 Where does GR00T select native versus patched execution?
+
+Paths below are relative to the **GR00T integration directory**. Environment declarations already live in `environments.py`; the migration changes their common infrastructure interface. That module must import only deployment-safe shared code; training-only `Enablement`/Engine registration belongs in `engine.py`.
+
+**`environments.py` — internal declarations:**
+
+```python
+NATIVE = Environment(
+    source=GitProject(UPSTREAM, revision=PINNED_COMMIT),
     provider=Uv(python="3.10", lock="uv.lock"),
 )
-openvino = Environment(
-    source=GitProject(
-        UPSTREAM_REPOSITORY, revision=PINNED_COMMIT,
-        patches=BundledPatches(plugin_files / "patches/openvino", tree=REVIEWED_TREE),
-    ),
-    provider=Uv(python="3.12", lock="uv.lock"),  # lock in the patched source
+OPENVINO = Environment(
+    source=GitProject(UPSTREAM, revision=PINNED_COMMIT, patches=OPENVINO_PATCHES),
+    provider=Uv(python="3.12", lock="uv.lock"),  # lock in the patched checkout
 )
-openvino_enablement = Enablement(
-    name="openvino", env=openvino,
-    provides={"gr00t_n1d7": {"export": ("openvino",)}},
-)
+# OPENVINO_PATCHES: PublishedPatches from Suite today; BundledPatches if owned here.
 ```
+
+**`engine.py` — inside `Gr00tEngine`, called by the user's Engine API:**
 
 ```python
-# Inside the GR00T Engine; native configs and artifact packaging stay here.
-completion = native.run(entrypoint=train_worker, args=native_training_args)
-exported = openvino.run(entrypoint=export_worker, args=[checkpoint, destination])
-package = package_for_runtime(exported, provenance=record_environment(openvino))
-```
-
-`PublishedPatches(repository=..., revision=..., files=..., tree=...)` can reference another team's series. Layers support published base patches plus local fixes. Source identity and provenance remain distinct: moving identical reviewed patches locally need not invalidate compatible environments/packages.
-
-### 3.4 Persistent inference and data flow
-
-```mermaid
-sequenceDiagram
-    participant Model as InferenceModel
-    participant Adapter as RuntimeAdapter
-    participant Session as Session
-    participant Child as Framework child
-    Model->>Adapter: load(artifact)
-    Adapter->>Session: start selected environment
-    Session->>Child: launch and verify handshake
-    Adapter->>Session: request(load, artifact)
-    Session->>Child: load model once
-    loop observation requests
-        Model->>Adapter: predict(observation)
-        Adapter->>Session: request(predict, observation)
-        Session->>Child: validated numeric frames
-        Child-->>Session: outputs
-        Session-->>Adapter: decoded outputs
-        Adapter-->>Model: mapped outputs
-    end
-    Model->>Adapter: reset through plugin lifecycle hook
-    Adapter->>Session: request(reset)
-    Session->>Child: reset model state
-    Model->>Adapter: close()
-    Adapter->>Session: close()
-    Session->>Child: stop and reap owned process
-```
-
-```python
-# Inference adapter internals: no training imports.
-class Adapter:
-    def load(self, artifact):
-        self.session = environment_for(artifact).start(
-            entrypoint=inference_worker, startup_timeout=60, request_timeout=10,
+class Gr00tEngine(TrainingEngine):
+    def train(self, config):
+        job = NATIVE.run(
+            entrypoint=plugin_files / "_worker/gr00t_train_worker.py",
+            args=to_native_cli_tokens(config),
         )
+        return to_engine_run(job.payload)
+
+    def export(self, checkpoint, destination, backend="native"):
+        if backend == "native":
+            return package_native(checkpoint, destination)
+        require_backend(backend, "openvino")
+        with staging_directory() as ir_directory:
+            OPENVINO.run(
+                entrypoint=plugin_files / "_worker/gr00t_export_worker.py",
+                args=export_arguments(checkpoint, ir_directory),
+            )
+            return package_openvino(ir_directory, destination)
+```
+
+`_worker/` owns calls into upstream GR00T and the Suite exporter. `package.py` writes model data, I/O mapping, environment provenance, and the Runtime manifest. No user calls `NATIVE.run()` or `OPENVINO.run()`.
+
+**`runtime.py` — inside the existing `Gr00tRuntimeAdapter`:**
+
+```python
+class Gr00tRuntimeAdapter(RuntimeAdapter):
+    def load(self, artifact):
+        env = matching_environment(artifact)  # recorded native/OpenVINO identity
+        self.session = env.start(entrypoint=inference_worker, request_timeout=10)
         try:
             self.session.request({"op": "load", "artifact": artifact})
         except Exception:
@@ -244,70 +269,59 @@ class Adapter:
         self.session.close()
 ```
 
-The session provides bounded framing, compatible-protocol checks, logs, errors, and shutdown. The plugin defines observation/output schemas and model state. JSON plus numeric buffers excludes pickle/object-array transport. Never automatically retry a stateful prediction. A converter or evaluation package can use the same process contract without importing Engine or `InferenceModel`.
+The plugin's inference entry point registers this adapter. `InferenceModel(package)` reads the manifest and selects it without importing `engine.py`. The child loads once and retains the model; Runtime close releases it, and plugin reset integration forwards episode reset. GR00T's model/processor stay in `_worker/gr00t_infer_worker.py`.
 
-### 3.5 Installation boundary
+## 5. What is actually shared?
 
-```bash
-# Target published installation contract; extras select plugins.
-uv pip install "physicalai-train[gr00t]"  # training host
-uv pip install physicalai-gr00t-policy-plugin  # deployment host, no physicalai-train
+```mermaid
+flowchart LR
+    User["User CLI / Python API"] --> Consumer["Studio dispatcher / Engine / RuntimeAdapter"]
+    Consumer -->|internal calls| Env["Environment: lazy handle"]
+    subgraph Shared["Proposed shared subpackage"]
+        Env --> Source["ProjectSource + optional patch layers"]
+        Env --> Provider["Provider: uv / other tool integration"]
+        Provider --> Prepared["PreparedEnvironment: internal launch data"]
+        Env --> Session["Session: process and channels"]
+        Prepared --> Session
+    end
+    Session <-->|bounded messages| Worker["Plugin-owned worker entry point"]
+    Worker --> Native["Trainer / native repo / model"]
 ```
 
-Every inference plugin must meet this separation in both host and child. Plugins own their integration code, locks, workers, patches/references, and declared upstream dependencies; “self-contained” does not require bundling drivers or licensed model assets into a wheel. Shared preparation must therefore be available outside `physicalai-train`.
+| Object                                              | Existing or proposed?                               | Owns                                                                                                  |
+| --------------------------------------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `Engine`/`Trainer`, `RuntimeAdapter`                | Existing in Runtime/Studio POCs                     | Public behavior and model-specific logic; not part of isolation.                                      |
+| `ProjectSource`, Git/bundled projects, patch series | Existing in PR #23                                  | Reviewed source materialization and identity/provenance.                                              |
+| `WorkerEnv` / `PreparedEnvironment`                 | Existing in POCs                                    | Current declaration and resolved cache paths; migration inputs, not two objects users must construct. |
+| `Environment`                                       | Proposed facade                                     | Prepare/reuse and `run`/`start`; construction has no installation side effects.                       |
+| `Provider`                                          | Interface proposed; uv integration exists           | Consume a lock and return command, working directory, activation context.                             |
+| `Session`                                           | Shared interface proposed; runners exist separately | Child lifetime, generic completion/events, framed messages, deadlines, logs, cleanup.                 |
 
-## 4. Existing tools and remaining responsibilities
+The shared layer does not know training checkpoints or observation semantics. A completion supplies an `exit_code` and plugin-defined `payload`; the consumer translates these into its own result. Other packages can supply their own workers. Multiple training/export/inference processes can reuse one prepared dependency environment.
 
-| Option             | Can replace                                                       | Validate before adoption                                                              |
-| ------------------ | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| [uv][uv]           | Python installation and locked environment sync; current baseline | Lock/metadata agreement; lifecycle/IPC remain outside uv.                             |
-| [Pixi][pixi]       | Conda/PyPI environments, activation, tasks                        | Own Pixi lock; persistent worker and CUDA/OpenVINO behavior.                          |
-| [Isolate][isolate] | Candidate for environment and execution management                | Existing locks, resident models, serialization, cleanup, source/license, maintenance. |
-| [execnet][execnet] | Persistent interpreter gateways and channels                      | Separate environment installation; numeric buffers and bounded failure.               |
-| [Ray][ray]         | Actors, environments, distributed placement                       | Operational footprint justified by actual distributed requirements.                   |
-| OCI containers     | Native dependencies and prebuilt image delivery                   | Image distribution, device access, startup, lifecycle.                                |
+## 6. Tool choices and justification
 
-The [Pixi demo][pixi-demo] proves multi-environment task selection/file handoff, not persistent inference performance. Compare tools on the same workers and inputs. Alternatives are not validated GR00T backends merely by appearing in this table.
+| Option                      | Supplies                                              | Still to evaluate/integrate                                                                        |
+| --------------------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| [uv][uv]                    | Python and locked project installation; POC baseline  | Persistent lifecycle/IPC; lock freshness and source/patch policy.                                  |
+| [Pixi][pixi]                | Conda/PyPI environments, activation, tasks            | Persistent process reuse; an explicitly maintained Pixi lock, not automatic `uv.lock` equivalence. |
+| [Isolate][isolate]          | Candidate environment and execution library           | Existing locks, resident model state, serialization, cleanup, source/license, maintenance.         |
+| [execnet][execnet]          | Interpreter gateways and channels                     | Separate installation, numeric buffers, bounded failure.                                           |
+| [Ray][ray] / OCI containers | Distributed actors or image-based native dependencies | Operational/device/deployment cost appropriate to the application.                                 |
 
-**We need shared integration contracts, not necessarily our own manager.**
+**A shared contract does not imply a custom manager.** Delegate environment/process work an existing tool already handles. Residual code selects plugin-owned inputs, checks artifact/environment compatibility, and translates to the consumer's API. If a library satisfies the full contract directly, a separate wrapper may be unnecessary.
 
-```python
-# Same plugin behavior; provider-specific project/lock explicitly selected.
-env = Environment(source=project, provider=Uv(lock="uv.lock"))
-env = Environment(source=project, provider=Pixi(lock="pixi.lock", name="model"))
+Before adoption, compare tools using the same persistent worker—not the Pixi demo's one-task/model-load pattern. Validate clean inference installs without `physicalai-train`, first-party conflicting dependency jobs, LeRobot regressions, GR00T/Cosmos parity/reset/close, bounded failures, offline assets, immutable packages, and safe cache cleanup. Isolation is not a sandbox and must not silently retry stateful requests or execute artifact-selected commands.
 
-# If an existing library already satisfies the complete contract:
-env = ExistingLibraryIntegration(reviewed_configuration)
-```
+The shared implementation can initially ship in Runtime and later with a lightweight InferenceKit base or independent monorepo library ([packaging context][packaging]). Every inference plugin must work without training; this does not mean every plugin needs a child process or that moving source code removes Runtime's existing dependency footprint.
 
-Residual integration: plugin-owned source/patch/profile selection, artifact/environment compatibility, and translation to Engine or inference messages. Delegate anything else an external library supplies. Do not automatically translate locks, silently switch providers, or retain a custom implementation solely to preserve the prototype.
-
-## 5. Adoption criteria and open decisions
-
-```text
-Evaluate tools → extract common remainder → migrate LeRobot + GR00T
-              → validate separately versioned first-party jobs
-              → decide distribution ownership when needed
-```
-
-| Gate                 | Required evidence                                                                                                          |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| First-party behavior | Same public CLI/Trainer contract; two jobs with genuinely conflicting locks after dependency-packaging changes.            |
-| Existing plugins     | LeRobot native config/CLI/progress/cancellation; GR00T/Cosmos train/export/infer, parity, and reset/replay.                |
-| Deployment           | Clean plugin wheel install, no training package in host/child, read-only artifacts, offline dependencies and model assets. |
-| Lifecycle            | Startup/crash/request-timeout/cancellation/cleanup-failure tests; no leaked owned children or channels.                    |
-| Reproducibility      | Source/patch/lock verification, concurrent/interrupted preparation, active-session-safe cache cleanup.                     |
-| Tool comparison      | Cold provisioning, warm load, steady-state latency, memory, and maintenance footprint measured separately.                 |
-
-The layer can initially ship as a Runtime subpackage, later with a lightweight InferenceKit base or an independent monorepo library ([packaging context][packaging]). It must not import training, inference-model, or robot APIs. Moving source code alone does not remove the parent distribution's installation footprint.
-
-For feedback: **Which objects are necessary after selecting an existing tool? Which consumer/platform constraints are missing? Is separate installation needed now?**
+**Feedback requested:** Are the public/internal boundaries correct? Can an existing library remove more code? Which consumer/platform requirements are missing?
 
 [gr00t]: https://github.com/samet-akcay/physical-ai-studio/pull/23
 [lerobot]: https://github.com/samet-akcay/physical-ai-studio/pull/10
+[pixi-demo]: https://github.com/leoll2/pixi-demo
 [uv]: https://docs.astral.sh/uv/concepts/projects/sync/
 [pixi]: https://pixi.sh/latest/tutorials/multi_environment/
-[pixi-demo]: https://github.com/leoll2/pixi-demo
 [isolate]: https://pypi.org/project/isolate/
 [execnet]: https://execnet.readthedocs.io/
 [ray]: https://docs.ray.io/en/latest/ray-core/handling-dependencies.html
