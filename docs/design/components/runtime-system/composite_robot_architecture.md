@@ -1,5 +1,11 @@
 # Agentic Autonomy Layer (System 2)
 
+> **Superseded** by [`tiered_runtime_architecture.md`](./tiered_runtime_architecture.md),
+> which keeps this document's two-loop split, handle lifecycle, WorldState, success
+> estimates, and data flywheel, and replaces the one-skill-at-a-time dispatcher and
+> `CompositeSource` with effector leases, System 0/1/2 tiers, and partition-aware
+> deployment. Kept for history.
+
 This document defines the **agentic autonomy layer** for PhysicalAI: the deliberative
 system that turns a language goal into grounded robot behavior by perceiving, planning,
 optionally imagining outcomes in a world model, and dispatching skills to the reactive

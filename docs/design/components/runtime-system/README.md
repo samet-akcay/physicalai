@@ -17,7 +17,7 @@ CompositeController  one Controller that fuses multi-rate effector subsystems (D
 For a design review:
 
 1. [robot_runtime_architecture.md](./robot_runtime_architecture.md) — production single-rate runtime (Doc A)
-2. [composite_robot_architecture.md](./composite_robot_architecture.md) — agentic autonomy layer: Agent + Environment + Goal/Skill (Doc B)
+2. [tiered_runtime_architecture.md](./tiered_runtime_architecture.md) — System 0/1/2 on any hardware layout: RobotRuntime per partition, Executive + Behaviors + Leases, framework-agnostic models, three contracts (proposal; supersedes Doc B)
 3. [policy_evaluation_design.md](./policy_evaluation_design.md) — exported-policy evaluation
 4. [policy_server_design.md](./policy_server_design.md) — remote inference
 5. [design_review_summary.md](./design_review_summary.md) — one-page summary
@@ -51,15 +51,16 @@ physicalai run --config so101_act.yaml --duration-s 60
 
 ## Documents
 
-| File                                                                       | Use it for                                                          |
-| -------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| [robot_runtime_architecture.md](./robot_runtime_architecture.md)           | **Doc A.** Production single-rate runtime; merges the old policy runtime design |
-| [composite_robot_architecture.md](./composite_robot_architecture.md)       | **Doc B.** Agentic autonomy layer: deliberative Agent, Environment (real/sim/world-model), Goal/Skill, and CompositeController |
-| [policy_runtime_design.md](./policy_runtime_design.md)                     | Deprecated stub redirecting to Doc A                                |
-| [policy_evaluation_design.md](./policy_evaluation_design.md)               | Exported-policy evaluation, scope split, naming                     |
-| [policy_server_design.md](./policy_server_design.md)                       | Remote inference with `PolicyServer` and `RemoteExecution`          |
-| [design_review_summary.md](./design_review_summary.md)                     | One-page summary for colleagues                                     |
-| [inference_comparison_report.md](./inference_comparison_report.md)         | Background gap analysis                                             |
+| File                                                                 | Use it for                                                                                                                                  |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| [robot_runtime_architecture.md](./robot_runtime_architecture.md)     | **Doc A.** Production single-rate runtime; merges the old policy runtime design                                                             |
+| [tiered_runtime_architecture.md](./tiered_runtime_architecture.md)   | **Proposal.** System 0/1/2 across processes, accelerators, VMs, and machines; supersedes Doc B                                              |
+| [composite_robot_architecture.md](./composite_robot_architecture.md) | **Doc B (superseded).** Agentic autonomy layer: deliberative Agent, Environment (real/sim/world-model), Goal/Skill, and CompositeController |
+| [policy_runtime_design.md](./policy_runtime_design.md)               | Deprecated stub redirecting to Doc A                                                                                                        |
+| [policy_evaluation_design.md](./policy_evaluation_design.md)         | Exported-policy evaluation, scope split, naming                                                                                             |
+| [policy_server_design.md](./policy_server_design.md)                 | Remote inference with `PolicyServer` and `RemoteExecution`                                                                                  |
+| [design_review_summary.md](./design_review_summary.md)               | One-page summary for colleagues                                                                                                             |
+| [inference_comparison_report.md](./inference_comparison_report.md)   | Background gap analysis                                                                                                                     |
 
 ## Related
 
@@ -74,7 +75,7 @@ physicalai run --config so101_act.yaml --duration-s 60
 2. `RobotRuntime.run()` is **synchronous**. Async lives behind the `Robot` adapter and inside `InferenceExecution`.
 3. `InferenceExecution` (sync / async-thread / async-process / remote) is the **only** sync/async boundary the runtime needs.
 4. `Controller` protocol stays minimal: `start / update / stop / reset` returning `Observation -> RobotAction`.
-5. Multi-system autonomy is **not** a callback or a runtime variant. A deliberative `Agent` (System 2) sits above the loop and dispatches `Skill`s; each `Skill` is executed as a `Controller` via `RobotRuntime.swap_controller()` (Doc B).
+5. Multi-system autonomy is **not** a callback or a runtime variant. One `RobotRuntime` per partition hosts the System 0/1 `ControlLoop`s and an `Executive` that runs `Behavior`s on leased effectors; System 2 clients drive it through the Executive API ([tiered_runtime_architecture.md](./tiered_runtime_architecture.md)).
 6. ROS 2 is an optional integration boundary, not a foundation.
 7. Current `RobotAction = np.ndarray`. The forward path is `np.ndarray | Mapping[str, Any]` (see [`../robot-interface.md`](../robot-interface.md)).
 8. `physicalai run` and `physicalai serve` ship in the runtime distribution without Torch or Lightning.
