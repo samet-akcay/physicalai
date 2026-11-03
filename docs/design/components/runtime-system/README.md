@@ -21,7 +21,7 @@ For a design review:
 1. [robot_runtime_architecture.md](./robot_runtime_architecture.md) — production single-rate runtime (Doc A)
 2. [tiered_runtime_architecture.md](./tiered_runtime_architecture.md) — System 0/1/2: ControlLoop per tier, RobotRuntime per robot; one description for every deployment; leases, framework-agnostic models, ROS 2 integration (proposal)
 3. [policy_evaluation_design.md](./policy_evaluation_design.md) — exported-policy evaluation
-4. [policy_server_design.md](./policy_server_design.md) — remote inference
+4. [policy_server_design.md](./policy_server_design.md) — earlier remote inference design (shipped as `RemoteInferenceModel` over Zenoh)
 5. [design_review_summary.md](./design_review_summary.md) — one-page summary
 
 For implementation, follow the phases in Doc A §16, then Doc B once an agentic or composite-robot integration is concrete.
@@ -53,16 +53,16 @@ physicalai run --config so101_act.yaml --duration-s 60
 
 ## Documents
 
-| File                                                                 | Use it for                                                                      |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| [robot_runtime_architecture.md](./robot_runtime_architecture.md)     | **Doc A.** Production single-rate runtime; merges the old policy runtime design |
-| [tiered_runtime_architecture.md](./tiered_runtime_architecture.md)   | **Proposal.** System 0/1/2 across processes, accelerators, VMs, and machines    |
-| [composite_robot_architecture.md](./composite_robot_architecture.md) | Earlier agentic-layer draft; superseded by the tiered runtime proposal          |
-| [policy_runtime_design.md](./policy_runtime_design.md)               | Deprecated stub redirecting to Doc A                                            |
-| [policy_evaluation_design.md](./policy_evaluation_design.md)         | Exported-policy evaluation, scope split, naming                                 |
-| [policy_server_design.md](./policy_server_design.md)                 | Remote inference with `PolicyServer` and `RemoteExecution`                      |
-| [design_review_summary.md](./design_review_summary.md)               | One-page summary for colleagues                                                 |
-| [inference_comparison_report.md](./inference_comparison_report.md)   | Background gap analysis                                                         |
+| File                                                                 | Use it for                                                                                               |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| [robot_runtime_architecture.md](./robot_runtime_architecture.md)     | **Doc A.** Production single-rate runtime; merges the old policy runtime design                          |
+| [tiered_runtime_architecture.md](./tiered_runtime_architecture.md)   | **Proposal.** System 0/1/2 across processes, accelerators, VMs, and machines                             |
+| [composite_robot_architecture.md](./composite_robot_architecture.md) | Earlier agentic-layer draft; superseded by the tiered runtime proposal                                   |
+| [policy_runtime_design.md](./policy_runtime_design.md)               | Deprecated stub redirecting to Doc A                                                                     |
+| [policy_evaluation_design.md](./policy_evaluation_design.md)         | Exported-policy evaluation, scope split, naming                                                          |
+| [policy_server_design.md](./policy_server_design.md)                 | Earlier gRPC design; remote inference shipped as `RemoteInferenceModel` and `InferenceServer` over Zenoh |
+| [design_review_summary.md](./design_review_summary.md)               | One-page summary for colleagues                                                                          |
+| [inference_comparison_report.md](./inference_comparison_report.md)   | Background gap analysis                                                                                  |
 
 ## Related
 
