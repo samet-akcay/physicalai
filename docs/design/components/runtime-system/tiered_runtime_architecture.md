@@ -277,7 +277,7 @@ runtime exposes them through endpoints:
 ```python
 RobotRuntime(
     loops={"s1": ControlLoop(robot=SO101(port="/dev/ttyACM0"), action_source=skills, fps=30)},
-    serve=[SkillsServer(port=7001), McpServer()],
+    serve=[SkillsServer(skills, port=7001), McpServer(skills)],
 ).run()
 ```
 
@@ -344,7 +344,7 @@ s1 = ControlLoop(robot=s0, action_source=skills, fps=50, cameras=cameras)
 robot = RobotRuntime(
     loops={"s0": s0, "s1": s1},
     nodes={"planner": Agent(planner_model, skills)},
-    serve=[SkillsServer(port=7001)],
+    serve=[SkillsServer(skills, port=7001)],
     placement={"s0": "rt-guest", "s1": "robot-main", "planner": "cloud"},
 )
 ```
@@ -458,7 +458,7 @@ The runtime is responsible for:
 | -------------- | ------------------------------------------------------------------------------------------------ |
 | Placement      | Hosts only the loops and nodes assigned to the current partition                                 |
 | Links          | Connects every pair of components in memory or over a transport ([§11](#11-links-and-placement)) |
-| Endpoints      | Exposes `Skills` to external clients through the servers in `serve`                              |
+| Endpoints      | Hosts the servers in `serve`; each server names the `Skills` object it exposes                   |
 | Lifecycle      | Starts from the bottom tier up and stops from the top down                                       |
 | Health         | Aggregates the liveness of every loop, node, and link                                            |
 | Emergency stop | Propagates `stop(emergency=True)` to every partition; each `SafetyGate` holds or brakes          |
