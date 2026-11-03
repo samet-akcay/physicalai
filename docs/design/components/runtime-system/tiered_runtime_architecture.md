@@ -53,8 +53,9 @@ This proposal keeps that loop unchanged and builds the three tiers by compositio
 Agent ──goals──► Skills ──action_source──► RobotRuntime (System 1) ──robot──► RobotRuntime (System 0) ──robot──► SafetyGate ──► hardware
 ```
 
-- An **agent** (a script, Studio, an MCP host, a built-in tool loop, or a human) submits
-  **goals**.
+- An **agent** uses a reasoning model to decide what the robot should do next and
+  submits **goals**. Agents are one kind of **client**; scripts, Studio, and humans
+  submit goals directly.
 - **`Skills`** runs each goal as a **skill** on leased parts of the robot. It is an action
   source, so it plugs into `RobotRuntime` like `PolicySource` does.
 - The tier below a runtime is its **robot**. That robot can be hardware, another
@@ -99,7 +100,7 @@ environments (in progress).
 4. Accept models from any backend.
 5. Let independent workloads use disjoint parts of the robot concurrently.
 6. Support teleoperation, human-in-the-loop intervention, and DAgger.
-7. Enforce safety that no action source, callback, or agent can bypass.
+7. Enforce safety that no action source, callback, or client can bypass.
 8. Record a labeled episode for every run.
 9. Keep existing scripts and configurations working unchanged.
 10. Keep Python construction, YAML, and the CLI equivalent.
@@ -113,21 +114,22 @@ and training.
 
 ## 3. Terminology
 
-Prose uses lowercase for concepts (agent, goal, skill). Code font denotes classes.
+Prose uses lowercase for concepts (client, goal, skill). Code font denotes classes.
 Tiers are written System 0, 1, and 2 in prose and `s0`, `s1`, and `s2` in code and
 configuration. "Skill" means robot skill unless qualified otherwise.
 
 **Core concepts**
 
-| Term              | Definition                                                                                                           |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------- |
-| **Agent**         | Any client that submits goals: a script, Studio, an MCP host, a built-in tool loop, or a human. A role, not a class. |
-| **Goal**          | One request: a skill name, its parameters, and an optional success check.                                            |
-| **Skill**         | A robot capability such as `pick`, `servo`, or `navigate_to`. Implements the `Skill` protocol.                       |
-| **`Skills`**      | The action source that runs skills: it accepts goals, grants leases, and merges the actions of running skills.       |
-| **`SkillHandle`** | The client's view of one running skill: status, feedback, update, cancel, and result.                                |
-| **Part**          | A named, commandable part of the robot, such as `arm`, `gripper`, `base`, or `whole_body`. Parts nest.               |
-| **Lease**         | Exclusive, time-limited write access to a set of parts, renewed by heartbeat.                                        |
+| Term              | Definition                                                                                                                |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| **Client**        | Anything that submits goals to `Skills`: an agent, a script, Studio, or a human.                                          |
+| **Agent**         | A client that uses a reasoning model to choose goals. The built-in `Agent` class is one; an external MCP host is another. |
+| **Goal**          | One request: a skill name, its parameters, and an optional success check.                                                 |
+| **Skill**         | A robot capability such as `pick`, `servo`, or `navigate_to`. Implements the `Skill` protocol.                            |
+| **`Skills`**      | The action source that runs skills: it accepts goals, grants leases, and merges the actions of running skills.            |
+| **`SkillHandle`** | The client's view of one running skill: status, feedback, update, cancel, and result.                                     |
+| **Part**          | A named, commandable part of the robot, such as `arm`, `gripper`, `base`, or `whole_body`. Parts nest.                    |
+| **Lease**         | Exclusive, time-limited write access to a set of parts, renewed by heartbeat.                                             |
 
 **Existing components**
 
@@ -164,7 +166,7 @@ configuration. "Skill" means robot skill unless qualified otherwise.
 ## 4. Architecture
 
 ```text
-Agent (script │ Studio │ MCP host │ built-in tool loop │ human)
+Client (Agent │ MCP host │ script │ Studio │ human)
    │  goals, through Skills or SkillsClient
    ▼
 Skills                         leases, WorldState, access policy, skill events
@@ -204,7 +206,7 @@ machine.
    its origin.
 6. Every write is bounded by a lease and a deadline. A missed heartbeat or deadline
    causes a hold or a stop.
-7. Every agent goes through `Skills`. There is no privileged path.
+7. Every client goes through `Skills`. There is no privileged path.
 8. Loops are placed by rate and models by memory. Moving a component across a partition
    boundary replaces it with its remote counterpart.
 
@@ -236,7 +238,7 @@ RobotRuntime(
 Single-purpose sessions such as a policy rollout or teleoperated data collection need
 neither skills nor agents.
 
-### 5.3 Scripted agent
+### 5.3 Scripted client
 
 ```python
 skills = Skills([
@@ -282,12 +284,14 @@ runtime:
         # place is analogous
 ```
 
-### 5.4 Built-in agent or MCP host
+### 5.4 Agent or MCP host
 
-The built-in agent is one reference implementation of the agent role:
+The built-in `Agent` sends the instruction to a reasoning model with each skill offered
+as a tool. It submits a goal for each tool call and returns the result to the model,
+until the model reports that the task is done:
 
 ```python
-ToolLoopAgent(OpenAICompatibleModel(base_url="http://localhost:30000/v1"), skills).run(
+Agent(OpenAICompatibleModel(base_url="http://localhost:30000/v1"), skills).run(
     "Put red blocks in the left bin and blue blocks in the right bin."
 )
 ```
@@ -341,7 +345,7 @@ Skills([
     PolicySkill(name="place", model=WorkerActionModel("./exports/place", framework="lerobot"), ...),
     PolicySkill(name="inspect", model=InferenceModel("./exports/inspect", device="NPU"), ...),
 ])
-ToolLoopAgent(OpenAICompatibleModel(base_url="http://localhost:30000/v1"), skills)       # SGLang, vLLM, llama.cpp
+Agent(OpenAICompatibleModel(base_url="http://localhost:30000/v1"), skills)               # SGLang, vLLM, llama.cpp
 ```
 
 Framework code stays in plugins. Moving a model from a local worker to a remote server
@@ -401,7 +405,7 @@ skills = Skills(
 RobotRuntime(robot=RemoteRobot("s0.local:7000"), action_source=skills, fps=50).run()
 
 # s2 partition (no device access)
-ToolLoopAgent(planner, SkillsClient("s1.local:7001")).run("Take the box from the shelf.")
+Agent(planner, SkillsClient("s1.local:7001")).run("Take the box from the shelf.")
 ```
 
 Skills on disjoint parts run concurrently under separate leases:
@@ -536,7 +540,7 @@ parts hold position.
 
 **`WorldState`.** `WorldState` stores the latest value of each fact, with one writer per
 key and no history. `Skills` writes robot state and camera frames from each tick.
-Perception components write detections and captions. Skills, success checks, and agents
+Perception components write detections and captions. Skills, success checks, and clients
 read from it.
 
 **Success checks.** A success check returns a confidence value rather than a boolean.
@@ -654,7 +658,7 @@ Safety is layered. Each layer is enforced independently of the layers above it.
 | Safety gate          | `SafetyGate`                     | Joint, velocity, workspace, and force limits on every command |
 | Stale-command hold   | `SetpointInbox`, `CommandServer` | Holds or stops when the tier above goes silent                |
 | Leases and deadlines | `Skills`, `CommandServer`        | A single writer per part                                      |
-| Access policy        | `Skills`                         | Which agents may run which skills                             |
+| Access policy        | `Skills`                         | Which clients may run which skills                            |
 | Partition boundary   | Deployment                       | The System 2 guest has no device access                       |
 
 The `unrestricted` access mode removes permission checks only. Safety gates, leases,
@@ -662,7 +666,7 @@ and deadlines remain in force.
 
 | Failure              | Response                                                    |
 | -------------------- | ----------------------------------------------------------- |
-| Agent disconnects    | Its lease expires; the skill is cancelled; parts hold       |
+| Client disconnects   | Its lease expires; the skill is cancelled; parts hold       |
 | System 2 crashes     | As above; System 1 and System 0 continue                    |
 | Remote model is late | The source holds and reports starvation; the skill may fail |
 | System 1 goes silent | System 0 applies its stale-command hold                     |
@@ -674,7 +678,7 @@ timestamps allow readers to detect stale facts.
 **Recording.** `Skills` receives the runtime's callback bus when it connects, as every
 action source does. It emits an event when a skill starts, is preempted, and ends. A
 recording callback uses these events to produce one episode per skill run. The episode
-contains the loop data in LeRobot format, the goal, the submitting agent, the outcome,
+contains the loop data in LeRobot format, the goal, the submitting client, the outcome,
 model provenance, intervention segments, and the agent transcript when one exists.
 Failed and cancelled runs are recorded in the same way as successful ones.
 
@@ -714,34 +718,34 @@ Failed and cancelled runs are recorded in the same way as successful ones.
 
 **Deferred decisions**
 
-| Topic                                  | Needed by                     |
-| -------------------------------------- | ----------------------------- |
-| Command modes and payloads             | Part-keyed actions            |
-| Wire formats for the three links       | Remote and VM deployment      |
-| Lease durations and priorities         | `Skills`                      |
-| Access-policy format                   | Multiple agents               |
-| Cross-partition transports             | Multi-host and KVM deployment |
-| Real-time platform for System 0        | Hosted heavy System 0         |
-| Clock synchronization                  | Multi-partition deployment    |
-| Deployment file format                 | `physicalai up`               |
-| Recording format extensions            | Data collection at scale      |
-| Package location of the built-in agent | System 2 clients              |
-| World-model interface                  | Imagine-and-rank planning     |
+| Topic                            | Needed by                     |
+| -------------------------------- | ----------------------------- |
+| Command modes and payloads       | Part-keyed actions            |
+| Wire formats for the three links | Remote and VM deployment      |
+| Lease durations and priorities   | `Skills`                      |
+| Access-policy format             | Multiple clients              |
+| Cross-partition transports       | Multi-host and KVM deployment |
+| Real-time platform for System 0  | Hosted heavy System 0         |
+| Clock synchronization            | Multi-partition deployment    |
+| Deployment file format           | `physicalai up`               |
+| Recording format extensions      | Data collection at scale      |
+| Package location of `Agent`      | System 2 clients              |
+| World-model interface            | Imagine-and-rank planning     |
 
 ---
 
 ## 15. Implementation Phases
 
-| Phase | Scope                                                                          | Exit criterion                                            |
-| ----- | ------------------------------------------------------------------------------ | --------------------------------------------------------- |
-| 1     | Part-keyed actions; `RobotRuntime.start()`                                     | Existing tests and configurations pass                    |
-| 2     | `SafetyGate`, `SetpointInbox`, `LoopRobot`                                     | Two-runtime stack on one host; gate tests pass            |
-| 3     | `Skills`, `Goal`, `PolicySkill`, `TeleopSkill`, leases, skill events           | Tabletop task from Python and YAML; HIL takeover recorded |
-| 4     | Worker and remote models; `ModelSpec`; inference link                          | Identical actions across placements                       |
-| 5     | `SkillsServer`, `SkillsClient`, `McpServer`; reasoning clients; built-in agent | Cloud agent and MCP host drive the same robot             |
-| 6     | Setpoint skills; `CommandServer` and `RemoteRobot`                             | Agent drives System 0; System 0 holds on silence          |
-| 7     | VM partitions; `physicalai up`                                                 | Humanoid or mobile robot runs across guests               |
-| 8     | Delegated navigation; world model                                              | Navigate, pick, and place in one task                     |
+| Phase | Scope                                                                   | Exit criterion                                            |
+| ----- | ----------------------------------------------------------------------- | --------------------------------------------------------- |
+| 1     | Part-keyed actions; `RobotRuntime.start()`                              | Existing tests and configurations pass                    |
+| 2     | `SafetyGate`, `SetpointInbox`, `LoopRobot`                              | Two-runtime stack on one host; gate tests pass            |
+| 3     | `Skills`, `Goal`, `PolicySkill`, `TeleopSkill`, leases, skill events    | Tabletop task from Python and YAML; HIL takeover recorded |
+| 4     | Worker and remote models; `ModelSpec`; inference link                   | Identical actions across placements                       |
+| 5     | `SkillsServer`, `SkillsClient`, `McpServer`; reasoning clients; `Agent` | Cloud agent and MCP host drive the same robot             |
+| 6     | Setpoint skills; `CommandServer` and `RemoteRobot`                      | Agent drives System 0; System 0 holds on silence          |
+| 7     | VM partitions; `physicalai up`                                          | Humanoid or mobile robot runs across guests               |
+| 8     | Delegated navigation; world model                                       | Navigate, pick, and place in one task                     |
 
 Phases 1 to 3 deliver value without the later phases.
 
@@ -751,6 +755,7 @@ Phases 1 to 3 deliver value without the later phases.
 
 ```text
 story           Agent → Goal → Skill → SkillHandle; Skills drives RobotRuntime
+clients         anything that submits goals; Agent is the built-in reasoning-model client
 tiers           System 0 control, System 1 policy, System 2 deliberation
 runtime         RobotRuntime runs one loop; its constructor is unchanged
 composition     tiers compose through robot (below) and action_source (above)

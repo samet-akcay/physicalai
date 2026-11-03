@@ -3,7 +3,8 @@
 This directory describes how PhysicalAI runs a robot: the production single-rate runtime that drives today's policy / teleop / HIL / DAgger / recording workflows, and the deliberative agentic layer that turns language goals into grounded behavior for humanoids, mobile manipulators, and world-model-driven pipelines.
 
 ```text
-Agent                any client that submits goals (script, Studio, MCP host, built-in tool loop)
+Client               anything that submits goals (Agent, MCP host, script, Studio, human)
+Agent                client that uses a reasoning model to choose goals
 Goal                 skill name, params, optional success check
 Skill                robot capability on leased parts (pick, servo, navigate_to)
 Skills               action source that runs skills and merges their actions
