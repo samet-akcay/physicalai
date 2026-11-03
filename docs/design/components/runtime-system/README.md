@@ -9,7 +9,8 @@ Goal                 skill name, params, optional success check
 Skill                robot capability on leased parts (pick, servo, navigate_to)
 Skills               action source that runs skills and merges their actions
 SkillHandle          client view of a run: status, feedback, update, cancel, result
-RobotRuntime         one fixed-rate loop; tiers compose through robot and action_source
+ControlLoop          one tier at a fixed rate (the class shipped today as RobotRuntime)
+RobotRuntime         a whole robot: loops, nodes, placement, links, lifecycle (proposed)
 ActionSource         tick-level action producer (policy, teleop, Skills) — existing
 ```
 
@@ -18,7 +19,7 @@ ActionSource         tick-level action producer (policy, teleop, Skills) — exi
 For a design review:
 
 1. [robot_runtime_architecture.md](./robot_runtime_architecture.md) — production single-rate runtime (Doc A)
-2. [tiered_runtime_architecture.md](./tiered_runtime_architecture.md) — System 0/1/2 by composing runtimes: Agent → Goal → Skills → RobotRuntime; partitions, leases, framework-agnostic models (proposal)
+2. [tiered_runtime_architecture.md](./tiered_runtime_architecture.md) — System 0/1/2: ControlLoop per tier, RobotRuntime per robot; one description for every deployment; leases, framework-agnostic models, ROS 2 integration (proposal)
 3. [policy_evaluation_design.md](./policy_evaluation_design.md) — exported-policy evaluation
 4. [policy_server_design.md](./policy_server_design.md) — remote inference
 5. [design_review_summary.md](./design_review_summary.md) — one-page summary
@@ -76,7 +77,7 @@ physicalai run --config so101_act.yaml --duration-s 60
 2. `RobotRuntime.run()` is **synchronous**. Async lives behind the `Robot` adapter and inside `InferenceExecution`.
 3. `InferenceExecution` (sync / async-thread / async-process / remote) is the **only** sync/async boundary the runtime needs.
 4. `Controller` protocol stays minimal: `start / update / stop / reset` returning `Observation -> RobotAction`.
-5. Multi-system autonomy is **not** a callback or a runtime variant. Agents submit goals to `Skills`, an action source that runs skills on leased robot parts; tiers compose through the existing `robot` and `action_source` slots, so the `RobotRuntime` constructor is unchanged ([tiered_runtime_architecture.md](./tiered_runtime_architecture.md)).
+5. Multi-system autonomy is **not** a callback or a runtime variant. Clients submit goals to `Skills`, an action source that runs skills on leased robot parts. Each tier is a `ControlLoop` (today's `RobotRuntime`, renamed in stages); the proposed `RobotRuntime` hosts the loops of one robot and links them in memory or across partitions according to placement ([tiered_runtime_architecture.md](./tiered_runtime_architecture.md)).
 6. ROS 2 is an optional integration boundary, not a foundation.
 7. Current `RobotAction = np.ndarray`. The forward path is `np.ndarray | Mapping[str, Any]` (see [`../robot-interface.md`](../robot-interface.md)).
 8. `physicalai run` and `physicalai serve` ship in the runtime distribution without Torch or Lightning.
