@@ -8,9 +8,9 @@ any backend, and the tiers may share one process or be spread across accelerator
 guests, or separate machines. The design is hardware-agnostic and does not depend on any
 external middleware.
 
-The document specifies architecture only. Message schemas, addressing, and numeric
-limits are deferred ([§16](#16-open-questions-and-deferred-decisions)). Code is pseudo-code
-unless marked **existing**.
+The document specifies architecture only. Message schemas, key layouts, and numeric
+limits are deferred ([§16](#16-open-questions-and-deferred-decisions)). Code is
+pseudo-code unless marked **existing**.
 
 ---
 
@@ -26,8 +26,8 @@ unless marked **existing**.
 8. [Actions and Parts](#8-actions-and-parts)
 9. [Goals and Skills](#9-goals-and-skills)
 10. [Models and Backends](#10-models-and-backends)
-11. [Links and Placement](#11-links-and-placement)
-12. [Safety, Time, and Recording](#12-safety-time-and-recording)
+11. [Communication Between Partitions](#11-communication-between-partitions)
+12. [Safety and Recording](#12-safety-and-recording)
 13. [Integrations](#13-integrations)
 14. [Migration](#14-migration)
 15. [Requirements Coverage](#15-requirements-coverage)
@@ -39,25 +39,32 @@ unless marked **existing**.
 
 ## 1. Summary
 
-The design separates two responsibilities:
+The design rests on four ideas:
 
 - A **`ControlLoop`** runs one tier at a fixed rate. On each tick it reads its robot, asks
   its action source for an action, passes the action through its callbacks, and sends
   it. This is the class that ships today as `RobotRuntime`, renamed
   ([§14](#14-migration)).
-- A **`RobotRuntime`** runs a whole robot. It hosts the control loops and the other
-  components, decides where each one runs, connects them, starts and stops them in
-  order, and exposes them to the outside.
+- A **`RobotRuntime`** runs everything in one partition (a process, VM, or machine): its
+  control loops, other components such as agents, and the servers that expose them. It
+  starts them in order, stops them in order, and reports their health.
+- **Components connect by object or by name.** In the same process, a component receives
+  the object it depends on. In another process, it receives a client that refers to the
+  object by name.
+- **A robot is a namespace.** All partitions of one robot join a shared namespace named
+  after the robot. Discovery, health, and emergency stop are messages in that namespace,
+  so the whole robot can be observed and stopped without a central object.
 
 ```python
-# one tier: unchanged behavior, new name
+# one tier
 ControlLoop(robot=so101, action_source=PolicySource(model), fps=30).run()
 
-# a whole robot
+# one partition with several components
 RobotRuntime(
-    loops={"s0": s0, "s1": s1},
+    robot_name="tabletop-1",
+    loops={"s1": ControlLoop(robot=so101, action_source=skills, fps=30)},
     nodes={"planner": Agent(planner_model, skills)},
-    placement={"s0": "rt-guest", "s1": "robot-main", "planner": "cloud"},  # omit to run locally
+    serve=[SkillsServer(skills, name="tabletop")],
 ).run()
 ```
 
@@ -73,11 +80,6 @@ Agent ──goals──► Skills ──drives──► ControlLoop s1 ──rob
 | **System 1** | Map observations to motion         | 10–50 Hz               | VLA, ACT, diffusion, navigation        |
 | **System 0** | Track setpoints and enforce limits | 200 Hz – 1 kHz         | WBC, IK, impedance, vendor controllers |
 
-Components never know where they run. The runtime chooses the link between any two
-components from their placement: in memory when they share a process, and over a
-transport otherwise. The same robot description therefore runs in one process, across
-accelerators, across KVM guests, or across machines.
-
 ---
 
 ## 2. Motivation
@@ -89,7 +91,8 @@ terminology common in this literature; System 0 denotes the control layer beneat
 
 These tiers place different demands on the platform. Their models often do not fit in
 the same memory. They need different operating-system and real-time guarantees. Some
-robot vendors run them in separate KVM guests on a single SoC.
+robot vendors run them in separate KVM guests on a single SoC, and the System 0 guest is
+often supplied by the vendor.
 
 **Current state.** PhysicalAI provides a single fixed-rate loop with pluggable action
 sources (`PolicySource`, `TeleopSource`) and callbacks; synchronous, asynchronous, and
@@ -102,8 +105,8 @@ framework plugins with isolated environments (in progress).
 
 1. Run System 0, 1, and 2 on one robot.
 2. Let a frontier model drive System 1 or System 0.
-3. Run the tiers in one process, across accelerators on one host, in separate KVM guests,
-   or on separate machines, from one description of the robot.
+3. Run the tiers in one process, across accelerators on one host, in separate KVM
+   guests, or on separate machines, including partitions owned by a vendor.
 4. Accept models from any backend, on any hardware.
 5. Let independent workloads use disjoint parts of the robot concurrently.
 6. Support teleoperation, human-in-the-loop intervention, and DAgger.
@@ -127,15 +130,15 @@ configuration. "Skill" means robot skill unless qualified otherwise.
 
 **Structure**
 
-| Term               | Definition                                                                                     |
-| ------------------ | ---------------------------------------------------------------------------------------------- |
-| **Tier**           | System 0, 1, or 2. A responsibility and rate band, not a process.                              |
-| **`ControlLoop`**  | Runs one tier at a fixed rate: read the robot, query the action source, apply callbacks, send. |
-| **`RobotRuntime`** | Runs a whole robot: hosts loops and nodes, places and links them, and manages their lifecycle. |
-| **Node**           | A component hosted by the runtime that is not a control loop, such as an agent or a perceiver. |
-| **Partition**      | A unit of deployment: a process, container, VM, or machine.                                    |
-| **Placement**      | The assignment of loops and nodes to partitions.                                               |
-| **Link**           | A connection between two components, implemented in memory or over a transport.                |
+| Term                | Definition                                                                                     |
+| ------------------- | ---------------------------------------------------------------------------------------------- |
+| **Tier**            | System 0, 1, or 2. A responsibility and rate band, not a process.                              |
+| **`ControlLoop`**   | Runs one tier at a fixed rate: read the robot, query the action source, apply callbacks, send. |
+| **`RobotRuntime`**  | Runs everything in one partition: loops, nodes, and servers, with their lifecycle.             |
+| **Node**            | A component hosted by a runtime that is not a control loop, such as an agent or a perceiver.   |
+| **Partition**       | A unit of isolation and deployment: a process, container, VM, or machine.                      |
+| **Robot namespace** | The shared key space of one robot's partitions, named after the robot.                         |
+| **Link**            | A connection between two components: an object reference, or a client and server by name.      |
 
 **Goals and skills**
 
@@ -168,31 +171,49 @@ configuration. "Skill" means robot skill unless qualified otherwise.
 
 ## 4. Architecture
 
+On a single host, one `RobotRuntime` holds every component and links them by object
+reference:
+
 ```text
-                 RobotRuntime: placement, links, endpoints, lifecycle, health
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ Clients: Agent │ MCP host │ ROS 2 app │ script │ Studio │ human               │
-│    │  goals                                                                  │
-│    ▼                                                                         │
-│ Skills (action source of s1): leases, WorldState, access policy, events      │
-│    ▼                                                                         │
-│ ControlLoop s1   10–50 Hz       models through ActionModel                   │
-│    │  robot = ControlLoop s0                                                 │
-│    ▼                                                                         │
-│ ControlLoop s0   200 Hz+        robot = SafetyGate(hardware or vendor)       │
-└──────────────────────────────────────────────────────────────────────────────┘
+one partition
+┌──────────────────────────────────────────────────────────────┐
+│ RobotRuntime "tabletop-1"                                     │
+│   nodes:  Agent ──► Skills                                    │
+│   loops:  s1 (50 Hz, action_source=Skills) ──► s0 (500 Hz)   │
+│           s0.robot = SafetyGate(hardware)                     │
+│   models: InferenceModel (in-process)                         │
+│   serve:  SkillsServer(name="tabletop"), McpServer            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Across partitions, each partition runs its own part, and links cross partitions by name
+inside the robot namespace:
+
+```text
+ rt-guest                 robot-main                         gpu                 cloud
+┌──────────────────┐     ┌───────────────────────────────┐  ┌────────────────┐  ┌──────────────────┐
+│ RobotRuntime     │     │ RobotRuntime                  │  │ InferenceServer │  │ Agent            │
+│  s0, 500 Hz      │◄────│  s1, 50 Hz                    │─►│  "bimanual"     │  │  SkillsClient    │
+│  SafetyGate(G1)  │robot│   robot = SharedRobot "g1"    │  └────────────────┘  │   ("humanoid")   │
+│  RobotServer "g1"│ link│   Skills → RemoteInference-   │  inference link      └────────┬─────────┘
+└──────────────────┘     │     Model("bimanual")         │                              │
+                         │  SkillsServer "humanoid"      │◄────── skills link ──────────┘
+                         └───────────────────────────────┘
+              all four partitions share the robot namespace "g1-lab3"
 ```
 
 ### Rules
 
-1. **Components are location-unaware.** Drivers, action sources, skills, models, and
-   agents are plain objects. None of them chooses a transport.
-2. **A `ControlLoop` runs one tier at one rate.** It holds no knowledge of other tiers.
-3. **The tier below a loop is its robot.** That robot is hardware, a vendor controller,
-   or another `ControlLoop`.
-4. **The `RobotRuntime` owns everything that spans components:** placement, links,
-   external endpoints, lifecycle order, health, and emergency stop.
-5. **One description per robot.** Only placement changes between deployments.
+1. **A `ControlLoop` runs one tier at one rate.** It holds no knowledge of other tiers.
+2. **The tier below a loop is its robot.** That robot is hardware, a vendor controller,
+   another `ControlLoop` in the same process, or a `SharedRobot` client for a loop in
+   another partition.
+3. **A `RobotRuntime` manages one partition.** It never manages components in another
+   partition.
+4. **Links are explicit.** A component receives either the object it depends on or a
+   client that names it. Nothing is rewired implicitly.
+5. **A robot is a namespace.** Robot-wide discovery, health, and emergency stop are
+   messages in the namespace, not methods of a central object.
 6. **Callbacks observe and transform actions.** They do not decide which action to send.
 7. **`SafetyGate` wraps the hardware,** so every command passes through it regardless of
    its origin.
@@ -201,15 +222,6 @@ configuration. "Skill" means robot skill unless qualified otherwise.
 9. **Every client goes through `Skills`.** There is no privileged path.
 10. **Integrations sit at the edges and implement these protocols.** The core never
     depends on them.
-
-### Execution model
-
-Internally, the runtime treats the robot as a small graph. Each loop and node is a
-vertex with a trigger: periodic (control loops and perceivers at their rate) or
-event-driven (agents and servers). Each edge is a typed link: `Robot`, `ActionSource`,
-`ActionModel`, or the skills API. Placement determines how each edge is implemented
-([§11](#11-links-and-placement)). Users do not build this graph explicitly; it follows
-from the object references in the robot description.
 
 ---
 
@@ -267,19 +279,20 @@ as a tool. It submits a goal for each tool call and returns the result to the mo
 until the model reports that the task is done:
 
 ```python
-Agent(OpenAICompatibleModel(base_url="http://localhost:30000/v1"), skills).run(
-    "Put red blocks in the left bin and blue blocks in the right bin."
-)
+RobotRuntime(
+    robot_name="tabletop-1",
+    loops={"s1": ControlLoop(robot=SO101(port="/dev/ttyACM0"), action_source=skills, fps=30)},
+    nodes={"planner": Agent(OpenAICompatibleModel(base_url="http://localhost:30000/v1"), skills)},
+    serve=[SkillsServer(skills, name="tabletop"), McpServer(skills)],
+).run()
 ```
 
-To let an external MCP host, Studio, or a ROS 2 application drive the same skills, the
-runtime exposes them through endpoints:
+An external MCP host, Studio, or a script on another machine drives the same skills
+through the skills link:
 
 ```python
-RobotRuntime(
-    loops={"s1": ControlLoop(robot=SO101(port="/dev/ttyACM0"), action_source=skills, fps=30)},
-    serve=[SkillsServer(skills, port=7001), McpServer(skills)],
-).run()
+skills = SkillsClient(name="tabletop", robot_name="tabletop-1")
+skills.submit(Goal("pick", {"object": "mug"})).result()
 ```
 
 The MCP tool list is generated from the skill list. If a client disconnects, its lease
@@ -316,72 +329,50 @@ source of the System 0 loop directly.
 
 ### 5.7 Mixed backends
 
-Each skill owns its model. A model runs in-process, is served by a server the runtime
-does not manage, or is named in the description so that the runtime places it:
+Each skill owns its model. A model runs in-process, or in another partition that serves
+it by name:
 
 ```python
-inspect_model = InferenceModel("./exports/inspect", device="NPU")       # in-process (existing)
-pick_model = RemoteInferenceModel(name="gr00t-pick", host="gpu-box")    # served externally (existing)
-place_model = InferenceModel("./exports/place")                         # placed by the runtime
-
 skills = Skills([
-    PolicySkill(name="inspect", model=inspect_model, ...),
-    PolicySkill(name="pick", model=pick_model, ...),
-    PolicySkill(name="place", model=place_model, ...),
+    PolicySkill(name="inspect", model=InferenceModel("./exports/inspect", device="NPU"), ...),
+    PolicySkill(name="pick", model=RemoteInferenceModel(name="gr00t-pick", host="gpu-box"), ...),
+    PolicySkill(name="place", model=RemoteInferenceModel(name="lerobot-place"), ...),
 ])
-
-RobotRuntime(
-    loops={"s1": ControlLoop(robot=so101, action_source=skills, fps=30)},
-    nodes={
-        "place_model": place_model,
-        "planner": Agent(OpenAICompatibleModel(base_url="http://localhost:30000/v1"), skills),
-    },
-    placement={"place_model": "lerobot-env"},
-)
 ```
 
-`place_model` is placed in the `lerobot-env` partition, a process in a separate Python
-environment prepared by `physicalai.isolate`. The runtime serves it there through
-`InferenceServer` and gives the `place` skill a `RemoteInferenceModel` for it. Removing
-the placement entry runs the model in-process instead. Framework code stays in plugins
-in every case.
+```bash
+# a GR00T server on a GPU host
+physicalai inference serve --name gr00t-pick --export-dir ./exports/pick --device GPU
+# a LeRobot server on the robot host, in its own Python environment
+physicalai inference serve --name lerobot-place --export-dir ./exports/place
+```
 
-### 5.8 Humanoid, one description for every deployment
+Framework code stays in plugins. Moving a model between in-process and served changes
+one argument: `InferenceModel(...)` becomes `RemoteInferenceModel(name=...)`.
+
+### 5.8 Humanoid on one host
 
 ```python
 s0 = ControlLoop(robot=SafetyGate(G1(), limits), fps=500)
-bimanual = InferenceModel("./exports/bimanual")
 skills = Skills([
-    PolicySkill(name="manipulate", model=bimanual, claims={"left_arm", "right_arm"}),
+    PolicySkill(name="manipulate", model=InferenceModel("./exports/bimanual"),
+                claims={"left_arm", "right_arm"}),
     DelegatedSkill(name="walk_to", controller=Nav2(), claims={"base"}),
     SetpointSkill(name="look_at", claims={"head"}),
 ])
 s1 = ControlLoop(robot=s0, action_source=skills, fps=50, cameras=cameras)
 
-robot = RobotRuntime(
+RobotRuntime(
+    robot_name="g1-lab3",
     loops={"s0": s0, "s1": s1},
-    nodes={"bimanual": bimanual, "planner": Agent(planner_model, skills)},
-    serve=[SkillsServer(skills, port=7001)],
-    placement={"s0": "rt-guest", "s1": "robot-main", "bimanual": "gpu", "planner": "cloud"},
-)
+    nodes={"planner": Agent(planner_model, skills)},
+    serve=[SkillsServer(skills, name="humanoid")],
+).run()
 ```
 
-`s0` has no action source, so it takes setpoints from the loop above it. Without
-`placement`, everything runs in one process with in-memory links. With `placement`,
-each partition runs the same description and hosts only its own components:
-
-```bash
-physicalai run --config humanoid.yaml --run.partition=rt-guest
-physicalai run --config humanoid.yaml --run.partition=robot-main
-physicalai run --config humanoid.yaml --run.partition=gpu
-physicalai run --config humanoid.yaml --run.partition=cloud
-```
-
-The runtime replaces each edge that crosses a partition with a remote link. The planner
-in the cloud partition reaches `skills` through the skills link, `s1` reaches `s0`
-through the robot command link, and the `manipulate` skill reaches `bimanual` through
-the inference link. Skills on disjoint parts run concurrently under
-separate leases:
+`s0` has no action source, so it takes setpoints from `s1`, which uses it as its robot.
+The runtime starts `s0` before `s1` and stops them in the reverse order. Skills on
+disjoint parts run concurrently under separate leases:
 
 ```python
 skills.submit(Goal("look_at", {"target": "shelf"}))
@@ -389,42 +380,47 @@ skills.submit(Goal("walk_to", {"target": "shelf"})).result()
 skills.submit(Goal("manipulate", {"task": "take the box"})).result()
 ```
 
-The same description in YAML. References between components are written by name; the
-reference syntax is illustrative:
+### 5.9 Humanoid across partitions
 
-```yaml
-runtime:
-  loops:
-    s0:
-      robot:
-        class_path: physicalai.runtime.SafetyGate
-        init_args:
-          robot: { class_path: physicalai.robot.unitree.G1 }
-          limits: ./limits/g1.yaml
-      fps: 500
-    s1:
-      robot: { ref: loops.s0 }
-      action_source:
-        class_path: physicalai.skills.Skills
-        init_args:
-          skills: [] # as above
-      fps: 50
-  nodes:
-    bimanual:
-      class_path: physicalai.inference.InferenceModel
-      init_args:
-        export_dir: ./exports/bimanual
-    planner:
-      class_path: physicalai.agent.Agent
-      init_args:
-        model: { class_path: physicalai.models.OpenAICompatibleModel }
-        skills: { ref: loops.s1.action_source }
-  placement:
-    s0: rt-guest
-    s1: robot-main
-    bimanual: gpu
-    planner: cloud
+The same robot split across a real-time guest, the main robot computer, a GPU host, and
+the cloud. Each partition has its own short description, and every link that crosses a
+partition names its peer:
+
+```python
+# rt-guest: System 0
+s0 = ControlLoop(robot=SafetyGate(G1(), limits), fps=500)
+RobotRuntime(robot_name="g1-lab3", loops={"s0": s0}, serve=[RobotServer(s0, name="g1")]).run()
+
+# robot-main: System 1 and skills
+skills = Skills([
+    PolicySkill(name="manipulate", model=RemoteInferenceModel(name="bimanual"),
+                claims={"left_arm", "right_arm"}),
+    DelegatedSkill(name="walk_to", controller=Nav2(), claims={"base"}),
+    SetpointSkill(name="look_at", claims={"head"}),
+])
+RobotRuntime(
+    robot_name="g1-lab3",
+    loops={"s1": ControlLoop(robot=SharedRobot.attach("g1"), action_source=skills, fps=50)},
+    serve=[SkillsServer(skills, name="humanoid")],
+).run()
+
+# cloud: System 2
+Agent(planner_model, SkillsClient(name="humanoid", robot_name="g1-lab3")).run(
+    "Take the box from the shelf."
+)
 ```
+
+```bash
+# gpu: the model server
+physicalai inference serve --name bimanual --export-dir ./exports/bimanual --device GPU
+```
+
+Compared with 5.8, three arguments change: `s1` takes `SharedRobot.attach("g1")` instead
+of `s0`, the skill takes `RemoteInferenceModel(name="bimanual")` instead of an
+`InferenceModel`, and the agent takes a `SkillsClient` instead of `skills`. Each
+partition can equally be a YAML file run with `physicalai run --config`. An optional
+deployment file lists the partitions and their hosts so that `physicalai up` can launch
+them together during development.
 
 ---
 
@@ -443,52 +439,51 @@ class ControlLoop:
     def start(self) -> None: ...                    # new: runs in a background thread
 ```
 
-| Argument        | Accepts                                                                                   |
-| --------------- | ----------------------------------------------------------------------------------------- |
-| `robot`         | Hardware, `SafetyGate`, a vendor controller, a ROS 2 controller, or another `ControlLoop` |
-| `action_source` | `PolicySource`, `TeleopSource`, `Skills`, a ROS 2 topic source, or none                   |
-| `callbacks`     | Recording, telemetry, and action filters                                                  |
-| `interpolator`  | Light System 0: splits each action into several robot commands (existing)                 |
+| Argument        | Accepts                                                                                                    |
+| --------------- | ---------------------------------------------------------------------------------------------------------- |
+| `robot`         | Hardware, `SafetyGate`, a vendor controller, a ROS 2 controller, another `ControlLoop`, or a `SharedRobot` |
+| `action_source` | `PolicySource`, `TeleopSource`, `Skills`, a ROS 2 topic source, or none                                    |
+| `callbacks`     | Recording, telemetry, and action filters                                                                   |
+| `interpolator`  | Light System 0: splits each action into several robot commands (existing)                                  |
 
-A loop without an action source is a lower tier: it takes setpoints from the loop that
-uses it as a robot, holds when they stop, and stops when they exceed their deadline.
+A loop without an action source is a lower tier. It takes setpoints from the loop that
+uses it as a robot, in the same process directly or from another partition through a
+`RobotServer`. It holds when setpoints stop and rejects setpoints past their deadline.
 
 ---
 
 ## 7. RobotRuntime
 
-`RobotRuntime` describes and runs a whole robot.
+`RobotRuntime` runs everything in one partition.
 
 ```python
 class RobotRuntime:
     def __init__(
         self,
-        loops: Mapping[str, ControlLoop],
+        robot_name: str,                                  # the robot namespace this partition joins
+        loops: Mapping[str, ControlLoop] | None = None,
         nodes: Mapping[str, Node] | None = None,          # agents, perceivers, monitors
-        serve: Sequence[Server] = (),                     # skills API, MCP, ROS 2 actions
-        placement: Mapping[str, str] | None = None,       # loop or node name -> partition
+        serve: Sequence[Server] = (),                     # RobotServer, SkillsServer, McpServer, ROS 2 actions
         callbacks: Sequence[Callback] = (),               # runtime events: health, recording
     ): ...
     @classmethod
     def from_config(cls, config: str | Path) -> Self: ...
-    def run(self, partition: str | None = None) -> None: ...
+    def run(self) -> None: ...
     def stop(self, *, emergency: bool = False) -> None: ...
     health: Mapping[str, Health]
 ```
 
-The runtime is responsible for:
+| Responsibility | Behavior                                                                                              |
+| -------------- | ----------------------------------------------------------------------------------------------------- |
+| Lifecycle      | Starts loops from the bottom tier up, then nodes, then servers; stops in the reverse order            |
+| Dependencies   | Waits, with a timeout, for every named peer its components require before starting them               |
+| Endpoints      | Hosts the servers in `serve`; each server names the object it exposes                                 |
+| Health         | Reports the liveness of its loops, nodes, and links, and publishes it in the robot namespace          |
+| Emergency stop | Stops its loops on a local `stop(emergency=True)` or on an emergency stop received from the namespace |
 
-| Responsibility | Behavior                                                                                         |
-| -------------- | ------------------------------------------------------------------------------------------------ |
-| Placement      | Instantiates and hosts only the loops and nodes assigned to the current partition                |
-| Links          | Connects every pair of components in memory or over a transport ([§11](#11-links-and-placement)) |
-| Endpoints      | Hosts the servers in `serve`; each server names the `Skills` object it exposes                   |
-| Lifecycle      | Starts from the bottom tier up and stops from the top down                                       |
-| Health         | Aggregates the liveness of every loop, node, and link                                            |
-| Emergency stop | Propagates `stop(emergency=True)` to every partition; each `SafetyGate` holds or brakes          |
-
-`run(partition=...)` is a method argument, so the existing configuration system parses
-it from the CLI as it parses the constructor.
+Every partition of a multi-partition robot has its own `RobotRuntime`, except partitions
+that contain a single component, such as an `InferenceServer` or an `Agent`, which need
+no supervisor.
 
 ---
 
@@ -540,6 +535,7 @@ class Skills(ActionSource):
 
 `Skill.start` returns a `SkillRun`, an internal object that `Skills` drives.
 `Skills.submit` wraps the run in a `SkillHandle` and returns that handle to the client.
+`SkillsClient` exposes the same `submit` and `world` surface in another partition.
 
 Skills fall into three types according to how they actuate the robot:
 
@@ -614,26 +610,19 @@ modality files, into a `ModelSpec`.
 | `ActionModel`    | OpenVINO and ONNX; LeRobot and GR00T through plugins                                                                   |
 | `ReasoningModel` | OpenAI-compatible servers (SGLang, vLLM, llama.cpp, Ollama); Anthropic; Gemini; in-process OpenVINO GenAI or llama.cpp |
 
-An action model runs in one of three ways:
+An action model runs in one of two ways:
 
-| Location                          | Mechanism                                                                                                       | Intended use                                                    |
-| --------------------------------- | --------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
-| In-process                        | `InferenceModel` (existing)                                                                                     | OpenVINO or ONNX models and other small models                  |
-| Another partition, runtime-placed | A model named in `nodes`; the runtime serves it with `InferenceServer` and links it with `RemoteInferenceModel` | Conflicting dependencies, crash isolation, a dedicated GPU host |
-| Served externally                 | `RemoteInferenceModel` (existing)                                                                               | Inference servers that the runtime does not manage              |
+| Location          | Mechanism                                                         | Intended use                                                    |
+| ----------------- | ----------------------------------------------------------------- | --------------------------------------------------------------- |
+| In-process        | `InferenceModel` (existing)                                       | OpenVINO or ONNX models and other small models                  |
+| Another partition | `RemoteInferenceModel(name=...)` and `InferenceServer` (existing) | Conflicting dependencies, crash isolation, a dedicated GPU host |
 
-Remote inference already exists. `RemoteInferenceModel` is a subclass of
-`InferenceModel`, and `InferenceServer` serves any `InferenceModel`, over Zenoh. Client
-and server agree on a named deployment slot, and a handshake checks the policy identity
-([remote inference guide](../../../how-to/runtime/run-inference-remotely.md)). Because
-the client is an `InferenceModel`, `PolicySource`, `PolicySkill`, and every execution
-mode use it unchanged. A runtime-placed model reuses the same pair: its node name is the
-deployment slot.
-
-A partition that hosts a model may be a process in a separate Python environment
+`RemoteInferenceModel` is a subclass of `InferenceModel`, so `PolicySource`,
+`PolicySkill`, and every execution mode use it unchanged
+([remote inference guide](../../../how-to/runtime/run-inference-remotely.md)). A
+partition that serves a model may be a process in a separate Python environment
 prepared by `physicalai.isolate`, which is how framework plugins with conflicting
-dependencies run. The server disables Zenoh shared memory, so same-host traffic uses
-TCP; its latency must be measured for local partitions.
+dependencies run.
 
 Remote System 1 inference is viable only when the action-chunk horizon exceeds the sum
 of network round-trip time, inference time, and a safety margin. If a chunk arrives
@@ -641,68 +630,106 @@ late, the source holds and `Skills` reports starvation to the skill.
 
 ---
 
-## 11. Links and Placement
+## 11. Communication Between Partitions
 
-Every edge in the robot description is one of three typed links. The runtime chooses
-the implementation of each link from the placement of its two ends:
+### Transport and namespace
 
-| Link               | Between                      | Same partition                | Different partitions                                      |
-| ------------------ | ---------------------------- | ----------------------------- | --------------------------------------------------------- |
-| Robot command link | A loop and the loop below it | Shared-memory setpoint buffer | Extends the existing `SharedRobot` transport              |
-| Inference link     | A model user and a model     | Direct call                   | The existing `RemoteInferenceModel` and `InferenceServer` |
-| Skills link        | A client and `Skills`        | Direct call                   | New: `SkillsServer` and `SkillsClient`                    |
+All partitions communicate over Zenoh through `physicalai.transport`, the transport that
+shared cameras, shared robots, and remote inference already use. Each partition opens a
+Zenoh session and joins the robot namespace given by `robot_name`. Names passed to
+clients and servers, such as `"g1"` or `"humanoid"`, resolve to keys inside that
+namespace.
 
-All three links use Zenoh through `physicalai.transport`, the transport that cameras,
-shared robots, and remote inference already use.
+Zenoh offers two communication patterns, and each message uses the one that matches its
+meaning:
 
-**Robot command link.** The existing `SharedRobot` transport provides an owner process
-that holds the hardware, state subscription and action publishing for any number of
-subscribers, discovery, and host-local exclusivity. The robot command link adds
+- **Publish and subscribe** for streams in which only the latest value matters: robot
+  state, setpoints, skill feedback, `WorldState` facts, heartbeats, and emergency stop.
+- **Query and reply** for requests that need an answer: handshakes, metadata, goal
+  submission, cancellation, lease requests, and inference requests.
+
+### Links
+
+| Link               | Client → server                            | Messages and pattern                                                                                                                    |
+| ------------------ | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Robot command link | `SharedRobot` → `RobotServer`              | Query: metadata (parts, command modes) and lease requests. Publish: part-keyed setpoints from the client, robot state from the server   |
+| Inference link     | `RemoteInferenceModel` → `InferenceServer` | Query: handshake, then one request per action chunk (existing)                                                                          |
+| Skills link        | `SkillsClient` → `SkillsServer`            | Query: list, submit, update, cancel. Publish: skill feedback and events from the server, heartbeats from the client, `WorldState` facts |
+
+**Robot command link.** `RobotServer` extends the existing `SharedRobot` owner protocol.
+The existing protocol provides an owner that holds the hardware, state publication,
+action subscription, discovery, and host-local exclusivity. The robot command link adds
 part-keyed setpoints, each carrying a mode, values, a timestamp, a deadline, and a
-lease. The lower loop rejects setpoints that have expired or carry the wrong lease, and
-it holds, decays, or stops when setpoints become stale. When several upper loops share
-one lower loop, the lower loop arbitrates between them by part. A native or vendor
-controller can implement this link directly when System 0 must run beyond Python's
-real-time limits.
+lease. Setpoints are published as latest-value messages and are never retransmitted: a
+late setpoint is useless, and the server rejects any setpoint that has passed its
+deadline or carries the wrong lease. When several upper loops share one lower loop, the
+server arbitrates between them by part. A native or vendor controller can implement the
+server side directly.
 
-**Inference link.** This link exists today. It streams observations to a named model
-server and returns action chunks, validates the policy identity in a handshake, and
-reports timing. The design adds a `ModelSpec` check at the handshake.
+**Inference link.** This link exists today. A handshake checks protocol version, policy
+identity, and optionally the manifest hash; each request then carries an observation and
+returns an action chunk within a timeout. The design adds a `ModelSpec` check to the
+handshake.
 
-**Skills link.** It lists skills, submits goals, streams updates, and supports update,
-cancel, and heartbeat calls. It also exposes `WorldState`, skill events, and an
-emergency stop. Missed heartbeats expire the caller's leases. External clients that are
-not part of the robot description use the same link through `SkillsClient`.
+**Skills link.** Goal submission is a query, so the client knows whether the goal was
+accepted. Each goal carries a client-generated identifier, which makes a retried
+submission idempotent. Feedback, status, and events are published so that any number of
+clients can observe a skill. The client publishes heartbeats for its leases; missed
+heartbeats expire them.
 
-**Authentication.** The existing Zenoh transports provide no application-level
-authentication. They rely on loopback binding, SSH tunnels, or network isolation. The
-access policy and the partition boundary hold across hosts only if the robot command
-and skills links authenticate their peers, so authentication is required for both
-before cross-host deployment.
+### Robot-wide messages
 
-**Construction per partition.** When a YAML description runs with
-`run(partition=...)`, the runtime instantiates only the components placed in that
-partition. `InferenceModel` loads its weights in its constructor, so this keeps each
-model's weights, and its dependencies, in the partition that runs it. A Python
-description constructs every component in the process that builds it, so multi-partition
-deployments use YAML.
+Messages that concern the whole robot are published in the robot namespace, so no
+central object is required:
 
-**Deployment layouts.** All layouts use the same description:
+| Message        | Publisher                | Subscribers                   | Purpose                                                          |
+| -------------- | ------------------------ | ----------------------------- | ---------------------------------------------------------------- |
+| Presence       | Every runtime and server | Studio, CLI, other partitions | Discovery of the partitions and endpoints that make up the robot |
+| Health         | Every runtime            | Studio, monitors              | Liveness of each loop, node, and link                            |
+| Emergency stop | Any authorized peer      | Every runtime                 | Immediate stop; each `SafetyGate` holds or brakes                |
 
-| Layout                         | Placement                                                                            |
-| ------------------------------ | ------------------------------------------------------------------------------------ |
-| One process                    | None; the interpolator may act as System 0                                           |
-| One host, several accelerators | System 0 in its own process for jitter isolation; models assigned to devices         |
-| Robot, GPU server, and cloud   | Large action models remote; the planner in the cloud partition                       |
-| KVM guests                     | One partition per guest; the System 2 guest holds no device drivers                  |
-| Vendor System 0                | The `s0` robot is the vendor driver, or the vendor implements the robot command link |
+The emergency stop is an active message and is not the only stop mechanism. If it is
+lost, the stale-command hold still stops every lower tier once the tier above falls
+silent.
 
-On a shared host, System 0 and System 2 should not share compute, and System 1 should
-take priority over System 2. Jitter must be measured on the target platform.
+### Startup and reconnection
+
+Each runtime starts its components only when the peers they name are reachable. A
+`SharedRobot` client first queries the server's metadata and checks that the parts and
+command modes it needs exist. A `RemoteInferenceModel` completes its handshake. A
+`SkillsClient` lists the skills it expects. If a peer is missing after a timeout, the
+runtime reports the failure and does not start the dependent component.
+
+After a link is lost and restored, the upper tier must request a new lease before it can
+command the robot again. Motion never resumes automatically after a reconnection.
+
+### Time
+
+Deadlines and staleness checks require a shared clock. Partitions on one SoC share the
+host clock; partitions on separate machines synchronize through PTP or NTP. Each
+handshake measures clock offset and round-trip time, and a link refuses to start when
+the offset exceeds its bound. All messages carry timestamps, and `WorldState` uses them
+to detect stale facts.
+
+### Security
+
+The existing Zenoh transports provide no application-level authentication; they rely on
+loopback binding, SSH tunnels, or network isolation. Across hosts, the robot command and
+skills links must authenticate their peers, and key-level access control must restrict
+each partition to the keys it needs. Access control is also what enforces the partition
+boundary: the System 2 partition may use the skills keys but not the robot command keys.
+
+### Large data
+
+Camera frames stay in the partition that consumes them where possible. When frames must
+cross partitions, they use the existing shared-camera transport or the image encoding
+that `RemoteInferenceModel` already applies. Between KVM guests, the transport runs over
+the virtual network; shared-memory transport between guests depends on hypervisor
+support and is deferred.
 
 ---
 
-## 12. Safety, Time, and Recording
+## 12. Safety and Recording
 
 Safety is layered. Each layer is enforced independently of the layers above it.
 
@@ -711,26 +738,23 @@ Safety is layered. Each layer is enforced independently of the layers above it.
 | Hardware / firmware  | Robot                          | Power, torque, and temperature limits                         |
 | Safety gate          | `SafetyGate`                   | Joint, velocity, workspace, and force limits on every command |
 | Stale-command hold   | Lower loop                     | Holds or stops when the tier above goes silent                |
-| Leases and deadlines | `Skills`, lower loop           | A single writer per part                                      |
+| Leases and deadlines | `Skills`, `RobotServer`        | A single writer per part                                      |
 | Access policy        | `Skills`                       | Which clients may run which skills                            |
 | Link authentication  | Robot command and skills links | Only authenticated peers send setpoints or submit goals       |
-| Partition boundary   | Placement                      | The System 2 partition holds no device drivers                |
-| Emergency stop       | `RobotRuntime`                 | Propagates to every partition                                 |
+| Partition boundary   | Key-level access control       | The System 2 partition cannot reach the robot command keys    |
+| Emergency stop       | Robot namespace                | Reaches every runtime of the robot                            |
 
 The `unrestricted` access mode removes permission checks only. Safety gates, leases,
 and deadlines remain in force.
 
-| Failure              | Response                                                    |
-| -------------------- | ----------------------------------------------------------- |
-| Client disconnects   | Its lease expires; the skill is cancelled; parts hold       |
-| System 2 crashes     | As above; System 1 and System 0 continue                    |
-| Remote model is late | The source holds and reports starvation; the skill may fail |
-| System 1 goes silent | System 0 applies its stale-command hold                     |
-| System 0 faults      | System 1 stops; running skills fail                         |
-| Link lost            | Treated as silence on the side that stops receiving         |
-
-**Time.** All partitions share a clock. Deadlines are absolute, and `WorldState`
-timestamps allow readers to detect stale facts.
+| Failure              | Response                                                       |
+| -------------------- | -------------------------------------------------------------- |
+| Client disconnects   | Its lease expires; the skill is cancelled; parts hold          |
+| System 2 crashes     | As above; System 1 and System 0 continue                       |
+| Remote model is late | The source holds and reports starvation; the skill may fail    |
+| System 1 goes silent | System 0 applies its stale-command hold                        |
+| System 0 faults      | System 1 stops; running skills fail                            |
+| Link lost            | Treated as silence; a new lease is required after reconnection |
 
 **Recording.** `Skills` receives its loop's callback bus when it connects, as every
 action source does. It emits an event when a skill starts, is preempted, and ends. A
@@ -748,13 +772,13 @@ not depend on any of them, and a deployment includes only the integrations it us
 
 **ROS 2.** Each ROS 2 concept maps to an existing protocol:
 
-| ROS 2 concept                              | Integration                                                  | Protocol       |
-| ------------------------------------------ | ------------------------------------------------------------ | -------------- |
-| `ros2_control` controller or ROS 2 driver  | `Ros2Robot`: a ROS 2 controller acts as System 0             | `Robot`        |
-| Command topic (joystick, external planner) | `Ros2Source`: a topic drives a loop                          | `ActionSource` |
-| Action server                              | `Ros2ActionServer`: each skill appears as a ROS 2 action     | Skills link    |
-| Action client (Nav2, MoveIt)               | `DelegatedSkill`: an existing ROS 2 stack performs the skill | `Skill`        |
-| TF and detection topics                    | A bridge that publishes and subscribes `WorldState` facts    | `WorldState`   |
+| ROS 2 concept                              | Integration                                                | Protocol       |
+| ------------------------------------------ | ---------------------------------------------------------- | -------------- |
+| `ros2_control` controller or ROS 2 driver  | `Ros2Robot`: a ROS 2 controller acts as System 0           | `Robot`        |
+| Command topic (joystick, external planner) | `Ros2Source`: a topic drives a loop                        | `ActionSource` |
+| Action server                              | `Ros2ActionServer`: each skill appears as a ROS 2 action   | Skills link    |
+| Action client (Nav2, MoveIt)               | `DelegatedSkill`: an existing ROS 2 stack performs a skill | `Skill`        |
+| TF and detection topics                    | A bridge that publishes and subscribes `WorldState` facts  | `WorldState`   |
 
 ROS 2 actions have the same structure as goals and skill handles (goal, feedback,
 result, and cancel), so a ROS 2 application can call PhysicalAI skills natively, and a
@@ -762,21 +786,21 @@ PhysicalAI client can call ROS 2 stacks as delegated skills.
 
 **Other integrations.** Execution backends, vendor SDKs, and other middleware can be
 added in the same way: as `Robot`, `ActionSource`, `ActionModel`, `Skill`, or server
-implementations, or as alternative link transports.
+implementations.
 
 ---
 
 ## 14. Migration
 
 The class that ships today as `RobotRuntime` is renamed to `ControlLoop`, and the name
-`RobotRuntime` is reused for the whole-robot runtime. The change is staged so that no
+`RobotRuntime` is reused for the partition runtime. The change is staged so that no
 single release breaks existing code:
 
-| Stage | Change                                                                                                                                                                                                                                                                                       | Effect on existing code                      |
-| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| 1     | Add `ControlLoop`; `RobotRuntime` becomes an alias for it                                                                                                                                                                                                                                    | None                                         |
-| 2     | Introduce the whole-robot `RobotRuntime`. For one minor release it still accepts `robot`, `action_source`, and `fps`, warns, and builds a one-loop runtime that forwards `run`, `stop`, `connect`, and the existing properties. Configurations that name the old class resolve the same way. | Deprecation warning                          |
-| 3     | Remove the compatibility path                                                                                                                                                                                                                                                                | Code must use `ControlLoop` for single loops |
+| Stage | Change                                                                                                                                                                                                                                                                                     | Effect on existing code                      |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------- |
+| 1     | Add `ControlLoop`; `RobotRuntime` becomes an alias for it                                                                                                                                                                                                                                  | None                                         |
+| 2     | Introduce the partition `RobotRuntime`. For one minor release it still accepts `robot`, `action_source`, and `fps`, warns, and builds a one-loop runtime that forwards `run`, `stop`, `connect`, and the existing properties. Configurations that name the old class resolve the same way. | Deprecation warning                          |
+| 3     | Remove the compatibility path                                                                                                                                                                                                                                                              | Code must use `ControlLoop` for single loops |
 
 Studio and the documentation move to `ControlLoop` during stage 1.
 
@@ -784,19 +808,19 @@ Studio and the documentation move to `ControlLoop` during stage 1.
 
 ## 15. Requirements Coverage
 
-| Requirement ([§2](#2-motivation))       | Mechanism                                                                                                                      |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| 1. System 0, 1, and 2 on one robot      | Loops linked through `robot`; agents and other clients call `Skills`                                                           |
-| 2. Frontier model drives System 1 or 0  | Goals to policy skills; `ServoSkill` setpoints to System 0                                                                     |
-| 3. Any deployment from one description  | Placement selects in-memory or remote links ([§11](#11-links-and-placement))                                                   |
-| 4. Models from any backend and hardware | Models are owned by skills and agents; frameworks stay in plugins; models run in-process, runtime-placed, or served externally |
-| 5. Concurrent work on disjoint parts    | Leases and part-keyed actions in `Skills`                                                                                      |
-| 6. Teleoperation, HIL, and DAgger       | `TeleopSource`; `TeleopSkill` preemption; intervention segments in episodes                                                    |
-| 7. Non-bypassable safety                | `SafetyGate` wraps the hardware; stale-command hold below every tier; runtime emergency stop                                   |
-| 8. Labeled episode per run              | Skill events on the existing callback bus                                                                                      |
-| 9. Python, YAML, and CLI equivalent     | Every component is a constructor argument; `run(partition=...)` is parsed like the constructor                                 |
-| 10. ROS 2 without dependency            | Edge integrations implementing existing protocols ([§13](#13-integrations))                                                    |
-| 11. Gradual migration                   | Staged rename with a compatibility release ([§14](#14-migration))                                                              |
+| Requirement ([§2](#2-motivation))       | Mechanism                                                                               |
+| --------------------------------------- | --------------------------------------------------------------------------------------- |
+| 1. System 0, 1, and 2 on one robot      | Loops linked through `robot`; agents and other clients call `Skills`                    |
+| 2. Frontier model drives System 1 or 0  | Goals to policy skills; `ServoSkill` setpoints to System 0                              |
+| 3. Any deployment layout                | Object links in one partition, named links across partitions, in one robot namespace    |
+| 4. Models from any backend and hardware | Models owned by skills and agents; in-process or served by name; frameworks in plugins  |
+| 5. Concurrent work on disjoint parts    | Leases and part-keyed actions in `Skills`                                               |
+| 6. Teleoperation, HIL, and DAgger       | `TeleopSource`; `TeleopSkill` preemption; intervention segments in episodes             |
+| 7. Non-bypassable safety                | `SafetyGate`; stale-command hold; leases; authenticated links; key-level access control |
+| 8. Labeled episode per run              | Skill events on the existing callback bus                                               |
+| 9. Python, YAML, and CLI equivalent     | Every component, including every link, is a constructor argument                        |
+| 10. ROS 2 without dependency            | Edge integrations implementing existing protocols ([§13](#13-integrations))             |
+| 11. Gradual migration                   | Staged rename with a compatibility release ([§14](#14-migration))                       |
 
 ---
 
@@ -806,30 +830,30 @@ Studio and the documentation move to `ControlLoop` during stage 1.
 
 1. **Rates within one tier.** All skills in one `Skills` object run at the host loop's
    rate. Workloads that need separate rates or processes, such as navigation and
-   manipulation, can run as two System 1 loops sharing one System 0, which arbitrates
-   by part.
+   manipulation, can run as two System 1 loops sharing one System 0 through
+   `RobotServer`, which arbitrates by part.
 2. **Delegated controllers.** External controllers such as Nav2 must send their
    commands through the robot command link so that `SafetyGate` and leases apply.
 3. **Combining a fixed source with skills.** Whether a loop may run a long-lived source
    (for example, teleoperation of the base) alongside skills, or whether such a source
    must itself be a skill.
-4. **Python descriptions across partitions.** Python constructs every component
-   eagerly, so multi-partition deployments use YAML. Whether Python descriptions also
-   need lazy construction is open.
+4. **Existing key layouts.** Whether the existing inference and shared-robot keys move
+   under the robot namespace, or keep their current layout with names unique per robot.
 
 **Deferred decisions**
 
 | Topic                                                  | Needed by                  |
 | ------------------------------------------------------ | -------------------------- |
 | Command modes and payloads                             | Part-keyed actions         |
-| Reference syntax in YAML                               | Multi-loop descriptions    |
 | Message schemas for the robot command and skills links | Multi-partition deployment |
-| Partition addressing and discovery                     | Multi-partition deployment |
-| Link authentication mechanism                          | Cross-host deployment      |
+| Key layout of the robot namespace                      | Multi-partition deployment |
+| Authentication and access-control mechanism            | Cross-host deployment      |
 | Lease durations and priorities                         | `Skills`                   |
 | Access-policy format                                   | Multiple clients           |
 | Real-time platform for System 0                        | Hosted heavy System 0      |
-| Clock synchronization                                  | Multi-partition deployment |
+| Clock-offset bounds                                    | Multi-partition deployment |
+| Shared memory between KVM guests                       | Guest-to-guest bandwidth   |
+| Deployment file format                                 | `physicalai up`            |
 | Recording format extensions                            | Data collection at scale   |
 | Package location of `Agent`                            | System 2 clients           |
 | World-model interface                                  | Imagine-and-rank planning  |
@@ -838,16 +862,16 @@ Studio and the documentation move to `ControlLoop` during stage 1.
 
 ## 17. Implementation Phases
 
-| Phase | Scope                                                                                                         | Exit criterion                                            |
-| ----- | ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
-| 1     | `ControlLoop` with `RobotRuntime` alias; part-keyed actions; `start()`                                        | Existing tests, configurations, and Studio pass           |
-| 2     | `SafetyGate`; a loop as the robot of another loop; single-partition `RobotRuntime`                            | System 0 and System 1 in one process; gate tests pass     |
-| 3     | `Skills`, `Goal`, `PolicySkill`, `TeleopSkill`, leases, skill events                                          | Tabletop task from Python and YAML; HIL takeover recorded |
-| 4     | Runtime-placed models through `InferenceServer`; isolated-environment partitions; `ModelSpec`                 | Identical actions in-process and served                   |
-| 5     | `SkillsServer`, `SkillsClient`, `McpServer`; reasoning clients; `Agent`                                       | Cloud agent and MCP host drive the same robot             |
-| 6     | Placement; robot command link on `SharedRobot`; remote skills link; link authentication; `run(partition=...)` | Same description runs in one process and across hosts     |
-| 7     | KVM partitions; runtime health and emergency stop; ROS 2 integrations                                         | Humanoid across guests; ROS 2 application calls skills    |
-| 8     | Delegated navigation; perceivers; world model                                                                 | Navigate, pick, and place in one task                     |
+| Phase | Scope                                                                                                          | Exit criterion                                            |
+| ----- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| 1     | `ControlLoop` with `RobotRuntime` alias; part-keyed actions; `start()`                                         | Existing tests, configurations, and Studio pass           |
+| 2     | `SafetyGate`; a loop as the robot of another loop; partition `RobotRuntime`                                    | System 0 and System 1 in one process; gate tests pass     |
+| 3     | `Skills`, `Goal`, `PolicySkill`, `TeleopSkill`, leases, skill events                                           | Tabletop task from Python and YAML; HIL takeover recorded |
+| 4     | `ModelSpec`; skills with `RemoteInferenceModel` and isolated-environment model servers                         | Identical actions in-process and served                   |
+| 5     | `SkillsServer`, `SkillsClient`, `McpServer`; reasoning clients; `Agent`                                        | Cloud agent and MCP host drive the same robot             |
+| 6     | `RobotServer` on the `SharedRobot` protocol; robot namespace; presence, health, emergency stop; authentication | System 0 and System 1 in separate processes and hosts     |
+| 7     | KVM partitions; key-level access control; ROS 2 integrations                                                   | Humanoid across guests; ROS 2 application calls skills    |
+| 8     | Delegated navigation; perceivers; world model                                                                  | Navigate, pick, and place in one task                     |
 
 Phases 1 to 3 deliver value without the later phases. The compatibility path of the
 old `RobotRuntime` constructor is removed one minor release after phase 2.
@@ -860,15 +884,16 @@ old `RobotRuntime` constructor is removed one minor release after phase 2.
 story           Agent → Goal → Skill → SkillHandle; Skills drives a ControlLoop
 tiers           System 0 control, System 1 policy, System 2 deliberation
 loop            ControlLoop runs one tier at one rate (the class formerly named RobotRuntime)
-runtime         RobotRuntime runs a whole robot: placement, links, endpoints, lifecycle
-composition     the tier below a loop is its robot; another loop can be that robot
-description     one robot description for every deployment; placement selects partitions
-links           robot command, inference, and skills; in memory or over Zenoh; authenticated
+runtime         RobotRuntime runs one partition: loops, nodes, servers, lifecycle, health
+robot           a namespace shared by its partitions; discovery, health, emergency stop
+composition     the tier below a loop is its robot: hardware, a loop, or a SharedRobot
+links           explicit: an object in the same partition, a client by name across partitions
+transport       Zenoh; publish-subscribe for latest-value streams, queries for requests
 clients         anything that submits goals; Agent is the built-in reasoning-model client
 skills          Skills is an ActionSource; attached, setpoint, and delegated skills
 actions         part-keyed command maps; flat arrays remain valid
-models          owned by skills and agents; in-process, runtime-placed, or served externally
-safety          SafetyGate wraps hardware; leases, deadlines, access policy, emergency stop
+models          owned by skills and agents; in-process or served by name
+safety          SafetyGate; leases and deadlines; authenticated links; key-level access control
 intervention    HIL is preemption by a higher-priority teleoperation skill
 integrations    at the edges, implementing existing protocols; the core depends on none
 migration       staged rename with one compatibility release
