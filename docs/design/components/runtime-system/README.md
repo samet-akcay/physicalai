@@ -6,9 +6,9 @@ This directory describes how PhysicalAI runs a robot: the production single-rate
 Client               anything that submits goals (Agent, MCP host, script, Studio, human)
 Agent                client that uses a reasoning model to choose goals
 Goal                 skill name, params, optional success check
-Skill                robot capability on leased parts (pick, servo, navigate_to)
-Skills               action source that runs skills and merges their actions
-SkillHandle          client view of a run: status, feedback, update, cancel, result
+Skill                robot capability; turns a goal into an action source for its parts
+Skills               a robot's set of skills; the action source that runs goals on leased parts
+SkillHandle          client view of a goal: status, feedback, update, cancel, result
 ControlLoop          one tier at a fixed rate (the class shipped today as RobotRuntime)
 RobotRuntime         everything in one partition: loops, nodes, servers, lifecycle (proposed)
 Robot namespace      shared by a robot's partitions: discovery, health, emergency stop

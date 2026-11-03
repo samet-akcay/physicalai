@@ -147,9 +147,9 @@ configuration. "Skill" means robot skill unless qualified otherwise.
 | **Client**        | Anything that submits goals: an agent, a script, Studio, a ROS 2 application, or a human.                                 |
 | **Agent**         | A client that uses a reasoning model to choose goals. The built-in `Agent` class is one; an external MCP host is another. |
 | **Goal**          | One request: a skill name, its parameters, and an optional success check.                                                 |
-| **Skill**         | A robot capability such as `pick`, `servo`, or `navigate_to`. Implements the `Skill` protocol.                            |
-| **`Skills`**      | The action source that runs skills: it accepts goals, grants leases, and merges the actions of running skills.            |
-| **`SkillHandle`** | The client's view of one running skill: status, feedback, update, cancel, and result.                                     |
+| **Skill**         | A robot capability such as `pick`, `servo`, or `navigate_to`. Turns a goal into an action source for its claimed parts.   |
+| **`Skills`**      | A robot's set of skills. As a loop's action source, it accepts goals, grants leases, and runs each goal's source.         |
+| **`SkillHandle`** | The client's view of one submitted goal: status, feedback, update, cancel, and result.                                    |
 | **Part**          | A named, commandable part of the robot, such as `arm`, `gripper`, `base`, or `whole_body`. Parts nest.                    |
 | **Lease**         | Exclusive, time-limited write access to a set of parts, renewed by heartbeat.                                             |
 
@@ -269,8 +269,8 @@ with ControlLoop(robot=SO101(port="/dev/ttyACM0"), action_source=skills, fps=30)
 ```
 
 For each goal, `Skills` checks the access policy, grants a lease on the claimed parts,
-attaches a `PolicySource`, and evaluates the success check. It then detaches the source
-and emits the events that delimit the recorded episode.
+builds a `PolicySource` from the skill, and runs it until the success check passes. It
+then disconnects the source and emits the events that delimit the recorded episode.
 
 ### 5.4 Agent or MCP host
 
@@ -323,8 +323,8 @@ skills = Skills([ServoSkill(name="servo", claims={"arm"}, max_step_m=0.01)])
 # The agent observes, submits Goal("servo", {"dx": 0.01}), and repeats until done.
 ```
 
-Each call writes a setpoint with a deadline. `SafetyGate` clamps it, and the loop holds
-the arm if calls stop arriving. Without a System 1 policy, `Skills` can be the action
+Each goal steps the arm toward the requested offset under a deadline. `SafetyGate`
+clamps every step, and the loop holds the arm if goals stop arriving. Without a System 1 policy, `Skills` can be the action
 source of the System 0 loop directly.
 
 ### 5.7 Mixed backends
@@ -515,59 +515,84 @@ class Goal:
     skill: str                          # "pick"
     params: Mapping[str, Any]           # {"object": "mug"}
     success: SuccessCheck | None = None # if None, the skill's default check applies
+    timeout_s: float | None = None
 
 class Skill(Protocol):
     name: str
     description: str
     params_schema: type[Params]         # generates the tool, form, and CLI schemas
     claims: frozenset[Part]
+    success: SuccessCheck | None        # default check; None runs until cancelled
 
     def can_start(self, goal: Goal, world: WorldState) -> Precondition: ...
-    def start(self, goal: Goal, ctx: SkillContext) -> SkillRun: ...
+    def source(self, goal: Goal) -> ActionSource: ...
 
 class Skills(ActionSource):
     def __init__(self, skills: Sequence[Skill], *, access: AccessPolicy | None = None): ...
     def submit(self, goal: Goal, *, priority: Priority = Priority.NORMAL) -> SkillHandle: ...
     def register(self, skill: Skill) -> None: ...
     world: WorldState
-    # ActionSource: update() merges the actions of running skills; idle parts hold
+    # ActionSource: update() merges the actions of running sources; idle parts hold
 ```
 
-`Skill.start` returns a `SkillRun`, an internal object that `Skills` drives.
-`Skills.submit` wraps the run in a `SkillHandle` and returns that handle to the client.
-`SkillsClient` exposes the same `submit` and `world` surface in another partition.
+`Skills` is a robot's set of skills: it accepts goals, grants leases, and runs skills on
+the loop. A skill turns a goal into an `ActionSource`, and `Skills` runs that source on
+the skill's claimed parts until the goal ends. `Skills.submit` returns a `SkillHandle`
+to the client. `SkillsClient` exposes the same `submit` and `world` surface in another
+partition.
 
-Skills fall into three types according to how they actuate the robot:
+Each stage of a goal maps onto the existing `ActionSource` protocol:
 
-| Type          | Actuation                                                  | Examples                                |
-| ------------- | ---------------------------------------------------------- | --------------------------------------- |
-| **Attached**  | Attaches an `ActionSource` to its claimed parts            | `PolicySkill`, `TeleopSkill`            |
-| **Setpoint**  | Writes one deadline-bounded setpoint per call              | `ServoSkill`, `SetpointSkill` (look-at) |
-| **Delegated** | Hands off to an external controller and mirrors its status | Nav2, vendor locomotion                 |
+| Stage                | Handled by                                                                                          |
+| -------------------- | --------------------------------------------------------------------------------------------------- |
+| Start                | `Skills` grants the lease, calls `skill.source(goal)`, and then calls `connect()` on the source     |
+| Each tick            | `Skills` calls `update()` on the source and keeps the action for the claimed parts                  |
+| Success              | The goal's success check, or the skill's default, passes                                            |
+| Failure              | `update()` raises, as the protocol already specifies, or the goal's timeout expires                 |
+| Cancel or preemption | `Skills` calls `disconnect()` on the source and holds the parts                                     |
+| Feedback             | `Skills` reports elapsed time and the confidence of the success check; other facts use `WorldState` |
+
+The same mechanism covers every skill:
+
+| Skill                           | Source built for each goal                                  | Default success check          |
+| ------------------------------- | ----------------------------------------------------------- | ------------------------------ |
+| `PolicySkill`                   | `PolicySource` over the skill's model, with the goal's task | Configured per skill           |
+| `TeleopSkill`                   | `TeleopSource` for the leader device                        | None: runs until cancelled     |
+| `SetpointSkill` (look-at)       | Emits the target setpoint                                   | Target reached                 |
+| `ServoSkill`                    | Steps toward the requested offset                           | Target reached                 |
+| `DelegatedSkill` (Nav2, MoveIt) | Forwards the external controller's commands                 | The controller reports success |
 
 `PolicySkill` is generic. Pick and place are configured instances of it, not subclasses:
 
 ```python
 class PolicySkill:
-    def start(self, goal, ctx):
-        source = PolicySource(self.model, task=self.task.format(**goal.params))
-        ctx.attach(source, parts=self.claims)
-        return AttachedRun(source, success=goal.success or self.success)
+    def source(self, goal):
+        return PolicySource(self.model, task=self.task.format(**goal.params))
 ```
 
-**Ticks.** On each tick, the loop calls `Skills.update()`. `Skills` applies pending
-attaches and detaches, queries each attached source for its parts, applies current
-setpoints, holds parts that have no writer, and returns the merged part-keyed action.
-All skills inside one `Skills` object therefore run at the host loop's rate. Slower
-sources hold between outputs, as `PolicySource` already does between action chunks.
+The model is loaded once, when the skill is constructed. Each goal receives a fresh
+source, so no state carries over between goals.
+
+Two consequences follow. First, completion is decided by a success check, never by the
+source: a policy cannot tell when its task is done. Second, every skill's commands pass
+through the loop, including those of external controllers, so `SafetyGate` and leases
+apply to all of them. A skill without a success check runs until it is cancelled or
+preempted, which covers long-lived sources such as teleoperation of the base.
+
+**Ticks.** On each tick, the loop calls `Skills.update()`. `Skills` starts and stops
+sources for pending goals, calls `update()` on each running source, evaluates success
+checks, holds parts that have no writer, and returns the merged part-keyed action. All
+skills inside one `Skills` object therefore run at the host loop's rate. Slower sources
+hold between outputs, as `PolicySource` already does between action chunks.
 
 **Leases.** Each part has at most one writer. Parts form a hierarchy, so a lease on
 `whole_body` covers the arms and the base. A higher-priority goal may preempt a
-lower-priority lease. If a lease misses its heartbeat, the skill is cancelled and the
+lower-priority lease. If a lease misses its heartbeat, the goal is cancelled and the
 parts hold position.
 
 **`SkillHandle`.** A handle exposes `status`, `feedback`, `update`, `cancel`, and
-`result`.
+`result`. `update` replaces the goal's parameters; `Skills` builds a new source from the
+skill under the same lease.
 
 **`WorldState`.** `WorldState` stores the latest value of each fact, with one writer per
 key and no history. `Skills` writes robot state and camera frames from each tick.
@@ -753,7 +778,7 @@ and deadlines remain in force.
 | System 2 crashes     | As above; System 1 and System 0 continue                       |
 | Remote model is late | The source holds and reports starvation; the skill may fail    |
 | System 1 goes silent | System 0 applies its stale-command hold                        |
-| System 0 faults      | System 1 stops; running skills fail                            |
+| System 0 faults      | System 1 stops; running goals fail                             |
 | Link lost            | Treated as silence; a new lease is required after reconnection |
 
 **Recording.** `Skills` receives its loop's callback bus when it connects, as every
@@ -772,13 +797,13 @@ not depend on any of them, and a deployment includes only the integrations it us
 
 **ROS 2.** Each ROS 2 concept maps to an existing protocol:
 
-| ROS 2 concept                              | Integration                                                | Protocol       |
-| ------------------------------------------ | ---------------------------------------------------------- | -------------- |
-| `ros2_control` controller or ROS 2 driver  | `Ros2Robot`: a ROS 2 controller acts as System 0           | `Robot`        |
-| Command topic (joystick, external planner) | `Ros2Source`: a topic drives a loop                        | `ActionSource` |
-| Action server                              | `Ros2ActionServer`: each skill appears as a ROS 2 action   | Skills link    |
-| Action client (Nav2, MoveIt)               | `DelegatedSkill`: an existing ROS 2 stack performs a skill | `Skill`        |
-| TF and detection topics                    | A bridge that publishes and subscribes `WorldState` facts  | `WorldState`   |
+| ROS 2 concept                              | Integration                                                               | Protocol       |
+| ------------------------------------------ | ------------------------------------------------------------------------- | -------------- |
+| `ros2_control` controller or ROS 2 driver  | `Ros2Robot`: a ROS 2 controller acts as System 0                          | `Robot`        |
+| Command topic (joystick, external planner) | `Ros2Source`: a topic drives a loop                                       | `ActionSource` |
+| Action server                              | `Ros2ActionServer`: each skill appears as a ROS 2 action                  | Skills link    |
+| Action client (Nav2, MoveIt)               | `DelegatedSkill`: a ROS 2 stack plans; its commands pass through the loop | `Skill`        |
+| TF and detection topics                    | A bridge that publishes and subscribes `WorldState` facts                 | `WorldState`   |
 
 ROS 2 actions have the same structure as goals and skill handles (goal, feedback,
 result, and cancel), so a ROS 2 application can call PhysicalAI skills natively, and a
@@ -832,12 +857,7 @@ Studio and the documentation move to `ControlLoop` during stage 1.
    rate. Workloads that need separate rates or processes, such as navigation and
    manipulation, can run as two System 1 loops sharing one System 0 through
    `RobotServer`, which arbitrates by part.
-2. **Delegated controllers.** External controllers such as Nav2 must send their
-   commands through the robot command link so that `SafetyGate` and leases apply.
-3. **Combining a fixed source with skills.** Whether a loop may run a long-lived source
-   (for example, teleoperation of the base) alongside skills, or whether such a source
-   must itself be a skill.
-4. **Existing key layouts.** Whether the existing inference and shared-robot keys move
+2. **Existing key layouts.** Whether the existing inference and shared-robot keys move
    under the robot namespace, or keep their current layout with names unique per robot.
 
 **Deferred decisions**
@@ -890,7 +910,8 @@ composition     the tier below a loop is its robot: hardware, a loop, or a Share
 links           explicit: an object in the same partition, a client by name across partitions
 transport       Zenoh; publish-subscribe for latest-value streams, queries for requests
 clients         anything that submits goals; Agent is the built-in reasoning-model client
-skills          Skills is an ActionSource; attached, setpoint, and delegated skills
+skills          a skill turns a goal into an ActionSource; Skills runs it on the claimed parts
+completion      decided by a success check, never by the source
 actions         part-keyed command maps; flat arrays remain valid
 models          owned by skills and agents; in-process or served by name
 safety          SafetyGate; leases and deadlines; authenticated links; key-level access control
