@@ -7,8 +7,8 @@ Agent                any client that submits goals (script, Studio, MCP host, bu
 Goal                 skill name, params, optional success check
 Skill                robot capability, run by the skills service (rt.skills)
 SkillHandle          client view of a run: status, feedback, update, cancel, result
-RobotRuntime         one per partition; hosts ControlLoops and the skills service
-ControlLoop          System 0 / System 1 fixed-rate loop body
+RobotRuntime         one per partition; runs a ControlLoop and the skills service
+ControlLoop          fixed-rate loop body (System 1, or System 0 in an s0 partition)
 ActionSource         tick-level action producer (policy, teleop) — existing
 ```
 
@@ -75,7 +75,7 @@ physicalai run --config so101_act.yaml --duration-s 60
 2. `RobotRuntime.run()` is **synchronous**. Async lives behind the `Robot` adapter and inside `InferenceExecution`.
 3. `InferenceExecution` (sync / async-thread / async-process / remote) is the **only** sync/async boundary the runtime needs.
 4. `Controller` protocol stays minimal: `start / update / stop / reset` returning `Observation -> RobotAction`.
-5. Multi-system autonomy is **not** a callback or a runtime variant. Agents submit goals; skills run on leased effectors via `rt.skills`; one `RobotRuntime` per partition hosts the System 0/1 `ControlLoop`s ([tiered_runtime_architecture.md](./tiered_runtime_architecture.md)).
+5. Multi-system autonomy is **not** a callback or a runtime variant. Agents submit goals; skills run on leased effectors via `rt.skills`; one `RobotRuntime` per partition, all configured through the same constructor that `from_config` and the CLI parse ([tiered_runtime_architecture.md](./tiered_runtime_architecture.md)).
 6. ROS 2 is an optional integration boundary, not a foundation.
 7. Current `RobotAction = np.ndarray`. The forward path is `np.ndarray | Mapping[str, Any]` (see [`../robot-interface.md`](../robot-interface.md)).
 8. `physicalai run` and `physicalai serve` ship in the runtime distribution without Torch or Lightning.
