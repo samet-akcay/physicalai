@@ -75,7 +75,7 @@ physicalai run --config so101_act.yaml --duration-s 60
 2. `RobotRuntime.run()` is **synchronous**. Async lives behind the `Robot` adapter and inside `InferenceExecution`.
 3. `InferenceExecution` (sync / async-thread / async-process / remote) is the **only** sync/async boundary the runtime needs.
 4. `Controller` protocol stays minimal: `start / update / stop / reset` returning `Observation -> RobotAction`.
-5. Multi-system autonomy is **not** a callback or a runtime variant. Agents submit goals; skills run on leased effectors via `rt.skills`; one `RobotRuntime` per partition, all configured through the same constructor that `from_config` and the CLI parse ([tiered_runtime_architecture.md](./tiered_runtime_architecture.md)).
+5. Multi-system autonomy is **not** a callback or a runtime variant. Agents submit goals; skills run on leased robot parts via `rt.skills`; one `RobotRuntime` per partition, all configured through the same constructor that `from_config` and the CLI parse ([tiered_runtime_architecture.md](./tiered_runtime_architecture.md)).
 6. ROS 2 is an optional integration boundary, not a foundation.
 7. Current `RobotAction = np.ndarray`. The forward path is `np.ndarray | Mapping[str, Any]` (see [`../robot-interface.md`](../robot-interface.md)).
 8. `physicalai run` and `physicalai serve` ship in the runtime distribution without Torch or Lightning.
