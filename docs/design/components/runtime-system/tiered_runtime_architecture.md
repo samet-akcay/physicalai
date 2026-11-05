@@ -5,8 +5,8 @@
 This document describes how PhysicalAI runs three tiers of robot decision-making: System 0
 (control), System 1 (reactive policy), and System 2 (deliberation). Models may come from
 any backend, and the tiers may share one process or be spread across accelerators, KVM
-guests, or separate machines. The design is hardware-agnostic and does not depend on any
-external middleware.
+guests, or separate machines. Components may be written in other languages, such as
+C++. The design is hardware-agnostic and does not depend on any external middleware.
 
 The document specifies architecture only. Message schemas, key layouts, and numeric
 limits are deferred ([§17](#17-open-questions-and-deferred-decisions)). Code is
@@ -122,7 +122,9 @@ framework plugins with isolated environments (in progress).
 9. Record a labeled episode for every run.
 10. Keep Python construction, YAML, and the CLI equivalent.
 11. Integrate with ROS 2 and other ecosystems without depending on them.
-12. Migrate existing code without an abrupt break.
+12. Accept components written in other languages, such as C++, in the same process or
+    in another partition.
+13. Migrate existing code without an abrupt break.
 
 **Out of scope.** Hypervisors, hard real-time control in Python (loops at 200 Hz and
 above remain native or vendor-provided), agent frameworks, general-purpose middleware,
@@ -853,6 +855,12 @@ meaning:
 - **Query and reply** for requests that need an answer: handshakes, metadata, goal
   submission, cancellation, lease requests, and inference requests.
 
+Messages are encoded as MessagePack with arrays tagged by dtype and shape, and camera
+frames as a packed binary header followed by pixel data (**existing**). Neither
+encoding depends on Python. Each link has a versioned message schema that is published
+with conformance tests, so a peer in any language with a Zenoh binding can implement
+either side of the link ([§14](#14-integrations)).
+
 ### Links
 
 | Link               | Client → server                            | Messages and pattern                                                                                                                    |
@@ -913,8 +921,8 @@ command the robot again. Motion never resumes automatically after a reconnection
 ### Time
 
 Every message carries capture time, not send time. Capture times are monotonic times on
-the host that took the measurement (**existing**), and monotonic clocks on different
-hosts are unrelated. Each link therefore measures the clock offset and round-trip time
+the host that took the measurement (**existing**), sent as integer nanoseconds, and
+monotonic clocks on different hosts are unrelated. Each link therefore measures the clock offset and round-trip time
 during the handshake, refreshes both with its heartbeats, and converts capture times to
 the receiver's clock before ages are computed. Partitions on one SoC share the host
 clock and need no conversion. Hosts that synchronize through PTP or NTP keep the offset
@@ -999,6 +1007,45 @@ ROS 2 actions have the same structure as goals and skill handles (goal, feedback
 result, and cancel), so a ROS 2 application can call PhysicalAI skills natively, and a
 PhysicalAI client can call ROS 2 stacks as delegated skills.
 
+**Components in other languages.** A component may be written in another language, such
+as C++ for efficiency, in one of two ways.
+
+_In the same process._ A native class exposed through Python bindings, such as nanobind
+or pybind11, implements one of the Python protocols: `Robot`, `ActionSource`,
+`ActionModel`, a camera, or a node. It is constructed, configured from YAML, and linked
+like any other object, and its `timing()` reports its native rate and latency. A native
+controller that runs its own high-rate loop appears as the `Robot` below a Python loop:
+
+```python
+wbc = NativeWholeBodyController(model="g1.urdf", rate=1000)   # C++, own 1 kHz thread
+s1 = ControlLoop(robot=SafetyGate(wbc, limits), action_source=skills, fps=50)
+```
+
+A native component releases the interpreter lock while it computes, so that it does
+not stall the loops that share its process.
+
+_In another partition._ A native process implements one side of a link through the
+Zenoh binding for its language. The Python side refers to it by name and is unchanged:
+
+| Native partition implements                                                | Python side uses                         |
+| -------------------------------------------------------------------------- | ---------------------------------------- |
+| Server side of the robot command link: System 0, WBC, or vendor controller | `SharedRobot.attach("g1")`               |
+| Server side of the inference link                                          | `RemoteInferenceModel(name="bimanual")`  |
+| `WorldState` facts on the skills link: perception, SLAM                    | Success checks and agents read the facts |
+| Client side of the skills link                                             | `SkillsServer(skills, name="humanoid")`  |
+
+A native partition does not run `RobotRuntime`, but it behaves as a partition. It
+completes the handshakes of its links, including protocol version, metadata, timing,
+and clock offset. It stamps every message with capture time. It publishes presence and
+health in the robot namespace and obeys emergency stop. It authenticates its peers and
+uses only the keys its access rights allow.
+
+Two constraints follow. First, every link schema is language-neutral and published with
+conformance tests that native peers run. Second, a native loop does not run Python
+callbacks, so recording subscribes to the state the loop publishes. The equivalence of
+Python, YAML, and the CLI applies to Python partitions. A native partition has its own
+configuration but uses the same robot, server, and part names.
+
 **Other integrations.** Execution backends, vendor SDKs, and other middleware can be
 added in the same way: as `Robot`, `ActionSource`, `ActionModel`, `Skill`, or server
 implementations.
@@ -1027,20 +1074,21 @@ the start, and a configuration may opt out explicitly during the compatibility r
 
 ## 16. Requirements Coverage
 
-| Requirement ([§2](#2-motivation))       | Mechanism                                                                               |
-| --------------------------------------- | --------------------------------------------------------------------------------------- |
-| 1. System 0, 1, and 2 on one robot      | Loops linked through `robot`; agents and other clients call `Skills`                    |
-| 2. Frontier model drives System 1 or 0  | Goals to policy skills; `ServoSkill` setpoints to System 0                              |
-| 3. Any deployment layout                | Object links in one partition, named links across partitions, in one robot namespace    |
-| 4. Models from any backend and hardware | Models owned by skills and agents; in-process or served by name; frameworks in plugins  |
-| 5. Concurrent work on disjoint parts    | Leases and part-keyed actions in `Skills`                                               |
-| 6. Teleoperation, HIL, and DAgger       | `TeleopSource`; `TeleopSkill` preemption; intervention segments in episodes             |
-| 7. Non-bypassable safety                | `SafetyGate`; stale-command hold; leases; authenticated links; key-level access control |
-| 8. Bounded action age                   | Capture times; `max_age`; budgets; timing graph derived and checked at startup          |
-| 9. Labeled episode per run              | Skill events on the existing callback bus                                               |
-| 10. Python, YAML, and CLI equivalent    | Every component, link, and budget is a constructor argument                             |
-| 11. ROS 2 without dependency            | Edge integrations implementing existing protocols ([§14](#14-integrations))             |
-| 12. Gradual migration                   | Staged rename and timing checks in reporting mode ([§15](#15-migration))                |
+| Requirement ([§2](#2-motivation))       | Mechanism                                                                                       |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| 1. System 0, 1, and 2 on one robot      | Loops linked through `robot`; agents and other clients call `Skills`                            |
+| 2. Frontier model drives System 1 or 0  | Goals to policy skills; `ServoSkill` setpoints to System 0                                      |
+| 3. Any deployment layout                | Object links in one partition, named links across partitions, in one robot namespace            |
+| 4. Models from any backend and hardware | Models owned by skills and agents; in-process or served by name; frameworks in plugins          |
+| 5. Concurrent work on disjoint parts    | Leases and part-keyed actions in `Skills`                                                       |
+| 6. Teleoperation, HIL, and DAgger       | `TeleopSource`; `TeleopSkill` preemption; intervention segments in episodes                     |
+| 7. Non-bypassable safety                | `SafetyGate`; stale-command hold; leases; authenticated links; key-level access control         |
+| 8. Bounded action age                   | Capture times; `max_age`; budgets; timing graph derived and checked at startup                  |
+| 9. Labeled episode per run              | Skill events on the existing callback bus                                                       |
+| 10. Python, YAML, and CLI equivalent    | Every component, link, and budget is a constructor argument                                     |
+| 11. ROS 2 without dependency            | Edge integrations implementing existing protocols ([§14](#14-integrations))                     |
+| 12. Components in other languages       | Bindings to the Python protocols; link schemas with conformance tests ([§14](#14-integrations)) |
+| 13. Gradual migration                   | Staged rename and timing checks in reporting mode ([§15](#15-migration))                        |
 
 ---
 
@@ -1060,38 +1108,39 @@ the start, and a configuration may opt out explicitly during the compatibility r
 
 **Deferred decisions**
 
-| Topic                                                  | Needed by                  |
-| ------------------------------------------------------ | -------------------------- |
-| Command modes and payloads                             | Part-keyed actions         |
-| Message schemas for the robot command and skills links | Multi-partition deployment |
-| Key layout of the robot namespace                      | Multi-partition deployment |
-| Authentication and access-control mechanism            | Cross-host deployment      |
-| Lease durations and priorities                         | `Skills`                   |
-| Access-policy format                                   | Multiple clients           |
-| Real-time platform for System 0                        | Hosted heavy System 0      |
-| Clock-offset bounds                                    | Multi-partition deployment |
-| Default `max_age` per component type                   | Timing checks              |
-| Timing declarations of vendor and ROS 2 controllers    | Integrations               |
-| Shared memory between KVM guests                       | Guest-to-guest bandwidth   |
-| Deployment file format                                 | `physicalai up`            |
-| Recording format extensions                            | Data collection at scale   |
-| Package location of `Agent`                            | System 2 clients           |
-| World-model interface                                  | Imagine-and-rank planning  |
+| Topic                                               | Needed by                                |
+| --------------------------------------------------- | ---------------------------------------- |
+| Command modes and payloads                          | Part-keyed actions                       |
+| Link schemas and conformance tests                  | Multi-partition deployment; native peers |
+| Native library for the link protocols               | Vendor and native partitions             |
+| Key layout of the robot namespace                   | Multi-partition deployment               |
+| Authentication and access-control mechanism         | Cross-host deployment                    |
+| Lease durations and priorities                      | `Skills`                                 |
+| Access-policy format                                | Multiple clients                         |
+| Real-time platform for System 0                     | Hosted heavy System 0                    |
+| Clock-offset bounds                                 | Multi-partition deployment               |
+| Default `max_age` per component type                | Timing checks                            |
+| Timing declarations of vendor and ROS 2 controllers | Integrations                             |
+| Shared memory between KVM guests                    | Guest-to-guest bandwidth                 |
+| Deployment file format                              | `physicalai up`                          |
+| Recording format extensions                         | Data collection at scale                 |
+| Package location of `Agent`                         | System 2 clients                         |
+| World-model interface                               | Imagine-and-rank planning                |
 
 ---
 
 ## 18. Implementation Phases
 
-| Phase | Scope                                                                                                                                | Exit criterion                                                                     |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
-| 1     | `ControlLoop` with `RobotRuntime` alias; part-keyed actions; `start()`; capture times; timing report                                 | Existing tests, configurations, and Studio pass                                    |
-| 2     | `SafetyGate`; a loop as the robot of another loop; partition `RobotRuntime`; timing checks and budgets                               | System 0 and System 1 in one process; predicted ages match measured ages           |
-| 3     | `Skills`, `Goal`, `PolicySkill`, `TeleopSkill`, leases, skill events                                                                 | Tabletop task from Python and YAML; HIL takeover recorded                          |
-| 4     | `ModelSpec`; skills with `RemoteInferenceModel` and isolated-environment model servers                                               | Identical actions in-process and served                                            |
-| 5     | `SkillsServer`, `SkillsClient`, `McpServer`; reasoning clients; `Agent`                                                              | Cloud agent and MCP host drive the same robot                                      |
-| 6     | `RobotServer` on the `SharedRobot` protocol; robot namespace; presence, health, emergency stop; authentication; timing in handshakes | System 0 and System 1 in separate processes and hosts; budgets checked across them |
-| 7     | KVM partitions; key-level access control; ROS 2 integrations                                                                         | Humanoid across guests; ROS 2 application calls skills                             |
-| 8     | Delegated navigation; perceivers; world model                                                                                        | Navigate, pick, and place in one task                                              |
+| Phase | Scope                                                                                                                                                                              | Exit criterion                                                                     |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| 1     | `ControlLoop` with `RobotRuntime` alias; part-keyed actions; `start()`; capture times; timing report                                                                               | Existing tests, configurations, and Studio pass                                    |
+| 2     | `SafetyGate`; a loop as the robot of another loop; partition `RobotRuntime`; timing checks and budgets                                                                             | System 0 and System 1 in one process; predicted ages match measured ages           |
+| 3     | `Skills`, `Goal`, `PolicySkill`, `TeleopSkill`, leases, skill events                                                                                                               | Tabletop task from Python and YAML; HIL takeover recorded                          |
+| 4     | `ModelSpec`; skills with `RemoteInferenceModel` and isolated-environment model servers                                                                                             | Identical actions in-process and served                                            |
+| 5     | `SkillsServer`, `SkillsClient`, `McpServer`; reasoning clients; `Agent`                                                                                                            | Cloud agent and MCP host drive the same robot                                      |
+| 6     | `RobotServer` on the `SharedRobot` protocol; robot namespace; presence, health, emergency stop; authentication; timing in handshakes; published link schemas and conformance tests | System 0 and System 1 in separate processes and hosts; budgets checked across them |
+| 7     | KVM partitions; key-level access control; ROS 2 integrations; a native System 0 partition                                                                                          | Humanoid across guests with a C++ System 0; ROS 2 application calls skills         |
+| 8     | Delegated navigation; perceivers; world model                                                                                                                                      | Navigate, pick, and place in one task                                              |
 
 Phases 1 to 3 deliver value without the later phases. The compatibility path of the
 old `RobotRuntime` constructor is removed one minor release after phase 2.
@@ -1119,6 +1168,7 @@ models          owned by skills and agents; in-process or served by name
 safety          SafetyGate; leases and deadlines; authenticated links; key-level access control
 intervention    HIL is preemption by a higher-priority teleoperation skill
 integrations    at the edges, implementing existing protocols; the core depends on none
+languages       any: in-process through bindings to the protocols, or as a partition on the link schemas
 migration       staged rename with one compatibility release
 terminology     robot skill (Skill) is distinct from agent skill (SKILL.md)
 ```

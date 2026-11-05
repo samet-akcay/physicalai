@@ -22,7 +22,7 @@ ActionSource         tick-level action producer (policy, teleop, Skills) — exi
 For a design review:
 
 1. [robot_runtime_architecture.md](./robot_runtime_architecture.md) — production single-rate runtime (Doc A)
-2. [tiered_runtime_architecture.md](./tiered_runtime_architecture.md) — System 0/1/2: ControlLoop per tier, RobotRuntime per partition, robot as a namespace; named links over Zenoh; capture times and timing checks derived from the objects; leases, framework-agnostic models, ROS 2 integration (proposal)
+2. [tiered_runtime_architecture.md](./tiered_runtime_architecture.md) — System 0/1/2: ControlLoop per tier, RobotRuntime per partition, robot as a namespace; named links over Zenoh; capture times and timing checks derived from the objects; components in any language; leases, framework-agnostic models, ROS 2 integration (proposal)
 3. [policy_evaluation_design.md](./policy_evaluation_design.md) — exported-policy evaluation
 4. [policy_server_design.md](./policy_server_design.md) — earlier remote inference design (shipped as `RemoteInferenceModel` over Zenoh)
 5. [design_review_summary.md](./design_review_summary.md) — one-page summary
