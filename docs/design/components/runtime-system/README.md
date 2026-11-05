@@ -5,6 +5,7 @@ This directory describes how PhysicalAI runs a robot: the production single-rate
 ```text
 Client               anything that submits goals (Agent, MCP host, script, Studio, human)
 Agent                client that uses a reasoning model to choose goals
+Conversation         ordered turns between people and an agent; shared by voice, chat, and CLI
 Goal                 skill name, params, optional success check
 Skill                robot capability; turns a goal into an action source for its parts
 Skills               a robot's set of skills; the action source that runs goals on leased parts

@@ -124,7 +124,8 @@ framework plugins with isolated environments (in progress).
 11. Integrate with ROS 2 and other ecosystems without depending on them.
 12. Accept components written in other languages, such as C++, in the same process or
     in another partition.
-13. Migrate existing code without an abrupt break.
+13. Let people instruct and answer the robot by speech, chat, or the command line.
+14. Migrate existing code without an abrupt break.
 
 **Out of scope.** Hypervisors, hard real-time control in Python (loops at 200 Hz and
 above remain native or vendor-provided), agent frameworks, general-purpose middleware,
@@ -152,16 +153,17 @@ configuration. "Skill" means robot skill unless qualified otherwise.
 
 **Goals and skills**
 
-| Term              | Definition                                                                                                                |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| **Client**        | Anything that submits goals: an agent, a script, Studio, a ROS 2 application, or a human.                                 |
-| **Agent**         | A client that uses a reasoning model to choose goals. The built-in `Agent` class is one; an external MCP host is another. |
-| **Goal**          | One request: a skill name, its parameters, and an optional success check.                                                 |
-| **Skill**         | A robot capability such as `pick`, `servo`, or `navigate_to`. Turns a goal into an action source for its claimed parts.   |
-| **`Skills`**      | A robot's set of skills. As a loop's action source, it accepts goals, grants leases, and runs each goal's source.         |
-| **`SkillHandle`** | The client's view of one submitted goal: status, feedback, update, cancel, and result.                                    |
-| **Part**          | A named, commandable part of the robot, such as `arm`, `gripper`, `base`, or `whole_body`. Parts nest.                    |
-| **Lease**         | Exclusive, time-limited write access to a set of parts, renewed by heartbeat.                                             |
+| Term               | Definition                                                                                                                |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| **Client**         | Anything that submits goals: an agent, a script, Studio, a ROS 2 application, or a human.                                 |
+| **Agent**          | A client that uses a reasoning model to choose goals. The built-in `Agent` class is one; an external MCP host is another. |
+| **Goal**           | One request: a skill name, its parameters, and an optional success check.                                                 |
+| **Skill**          | A robot capability such as `pick`, `servo`, or `navigate_to`. Turns a goal into an action source for its claimed parts.   |
+| **`Skills`**       | A robot's set of skills. As a loop's action source, it accepts goals, grants leases, and runs each goal's source.         |
+| **`SkillHandle`**  | The client's view of one submitted goal: status, feedback, update, cancel, and result.                                    |
+| **Part**           | A named, commandable part of the robot, such as `arm`, `gripper`, `base`, or `whole_body`. Parts nest.                    |
+| **Lease**          | Exclusive, time-limited write access to a set of parts, renewed by heartbeat.                                             |
+| **`Conversation`** | The ordered turns exchanged between people and an agent. Speech, chat, and the CLI share it.                              |
 
 **Time**
 
@@ -182,6 +184,7 @@ configuration. "Skill" means robot skill unless qualified otherwise.
 | **Callback**         | **Existing.** A hook that observes, and may transform, each action inside a loop.         |
 | **`ActionModel`**    | **Existing** as `InferenceModel`. Maps observations to action chunks.                     |
 | **`ReasoningModel`** | Maps messages, images, and tool definitions to text or tool calls.                        |
+| **`Voice`**          | A node that connects a microphone and a speaker to a conversation through speech models.  |
 | **`ModelSpec`**      | Declares the inputs a model expects and the outputs it produces.                          |
 | **`SafetyGate`**     | A `Robot` wrapper that enforces hard limits on every command before it reaches the robot. |
 | **`WorldState`**     | The latest timestamped facts: poses, detections, and captions.                            |
@@ -461,6 +464,41 @@ Each partition can equally be a YAML file run with `physicalai run --config`. An
 deployment file lists the partitions and their hosts so that `physicalai up` can launch
 them together during development.
 
+### 5.10 Speech
+
+Continuing the humanoid of 5.8, a `Voice` node turns speech into conversation turns and
+speaks the agent's replies:
+
+```python
+conversation = Conversation()
+voice = Voice(
+    microphone=Microphone("default"),
+    speaker=Speaker("default"),
+    stt=WhisperModel("./exports/whisper-small", device="NPU"),
+    tts=TextToSpeechModel("./exports/tts"),
+    conversation=conversation,
+    skills=skills,
+    stop_phrases=("stop", "halt"),
+)
+
+RobotRuntime(
+    robot_name="g1-lab3",
+    loops={"s0": s0, "s1": s1},
+    nodes={"voice": voice, "planner": Agent(planner_model, skills, conversation=conversation)},
+    serve=[SkillsServer(skills, name="humanoid")],
+).run()
+```
+
+The agent reads each turn, submits goals as before, and adds its replies, questions,
+and progress reports to the conversation, which `Voice` speaks. Studio chat and the CLI
+attach to the same conversation, so neither the agent nor anything below it knows
+whether a turn was spoken or typed. On a stop phrase, `Voice` calls `skills.stop()`
+directly rather than waiting for the reasoning model.
+
+When the microphone is on the robot and the agent is in the cloud, both sides construct
+`Conversation(name="main", robot_name="g1-lab3")`, and the turns cross partitions
+through the robot namespace.
+
 ---
 
 ## 6. ControlLoop
@@ -577,6 +615,7 @@ class Skills(ActionSource):
     def __init__(self, skills: Sequence[Skill], *, access: AccessPolicy | None = None): ...
     def submit(self, goal: Goal, *, priority: Priority = Priority.NORMAL) -> SkillHandle: ...
     def register(self, skill: Skill) -> None: ...
+    def stop(self) -> None: ...         # cancel every running goal; all parts hold
     world: WorldState
     # ActionSource: update() merges the actions of running sources; idle parts hold
 ```
@@ -655,6 +694,27 @@ ObjectAt               # a detector places the object in a target region
 VLMJudge               # a ReasoningModel judges the outcome from images
 ```
 
+**Conversation.** An agent takes instructions from `run()` or from a `Conversation`. A
+conversation is an ordered stream of turns, each with a speaker, text, and capture
+time. People add turns through `Voice`, Studio chat, or the CLI. The agent reads them
+while it works and adds its own turns. Turns are events rather than latest values: they
+are delivered in order and never dropped, so they do not pass through `WorldState`.
+
+```python
+class Conversation:
+    def __init__(self, name: str | None = None, robot_name: str | None = None): ...
+    def add(self, speaker: str, text: str) -> Turn: ...
+    def turns(self, since: int = 0) -> Iterator[Turn]: ...   # blocks for new turns
+
+class Agent:
+    def __init__(self, model: ReasoningModel, skills: Skills | SkillsClient, *,
+                 conversation: Conversation | None = None): ...
+    def run(self, instruction: str | None = None) -> None: ...
+```
+
+Without a name, a conversation is local to its partition. With a name, it is a stream
+in the robot namespace that any partition can join.
+
 ---
 
 ## 10. Models and Backends
@@ -670,7 +730,16 @@ class ActionModel(Protocol):     # existing as InferenceModel
 
 class ReasoningModel(Protocol):
     def complete(self, messages, *, tools=(), response_format=None) -> Completion: ...
+
+class SpeechToTextModel(Protocol):
+    def transcribe(self, audio: Stamped[Audio]) -> Transcript: ...
+
+class TextToSpeechModel(Protocol):
+    def synthesize(self, text: str) -> Audio: ...
 ```
+
+A reasoning model that accepts audio in its messages can take spoken turns directly,
+without a separate speech-to-text model.
 
 **`ModelSpec`.** A `ModelSpec` declares a model's inputs, its outputs, and the parts and
 command modes its outputs drive. For each observation input, it also declares the rate
@@ -680,10 +749,12 @@ default `max_age` of any source that runs the model. The startup checks of
 parts. Plugins convert native formats, such as LeRobot features and GR00T
 modality files, into a `ModelSpec`.
 
-| Interface        | Backends                                                                                                               |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `ActionModel`    | OpenVINO and ONNX; LeRobot and GR00T through plugins                                                                   |
-| `ReasoningModel` | OpenAI-compatible servers (SGLang, vLLM, llama.cpp, Ollama); Anthropic; Gemini; in-process OpenVINO GenAI or llama.cpp |
+| Interface           | Backends                                                                                                               |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `ActionModel`       | OpenVINO and ONNX; LeRobot and GR00T through plugins                                                                   |
+| `ReasoningModel`    | OpenAI-compatible servers (SGLang, vLLM, llama.cpp, Ollama); Anthropic; Gemini; in-process OpenVINO GenAI or llama.cpp |
+| `SpeechToTextModel` | In-process OpenVINO GenAI Whisper; OpenAI-compatible transcription servers                                             |
+| `TextToSpeechModel` | In-process OpenVINO; OpenAI-compatible speech servers                                                                  |
 
 An action model runs in one of two ways:
 
@@ -852,6 +923,8 @@ meaning:
 
 - **Publish and subscribe** for streams in which only the latest value matters: robot
   state, setpoints, skill feedback, `WorldState` facts, heartbeats, and emergency stop.
+  Conversation turns are the exception: they are published reliably with sequence
+  numbers, and a late subscriber queries the recent turns.
 - **Query and reply** for requests that need an answer: handshakes, metadata, goal
   submission, cancellation, lease requests, and inference requests.
 
@@ -895,11 +968,12 @@ heartbeats expire them.
 Messages that concern the whole robot are published in the robot namespace, so no
 central object is required:
 
-| Message        | Publisher                | Subscribers                   | Purpose                                                          |
-| -------------- | ------------------------ | ----------------------------- | ---------------------------------------------------------------- |
-| Presence       | Every runtime and server | Studio, CLI, other partitions | Discovery of the partitions and endpoints that make up the robot |
-| Health         | Every runtime            | Studio, monitors              | Liveness and measured ages of each loop, node, and link          |
-| Emergency stop | Any authorized peer      | Every runtime                 | Immediate stop; each `SafetyGate` holds or brakes                |
+| Message        | Publisher                    | Subscribers                   | Purpose                                                          |
+| -------------- | ---------------------------- | ----------------------------- | ---------------------------------------------------------------- |
+| Presence       | Every runtime and server     | Studio, CLI, other partitions | Discovery of the partitions and endpoints that make up the robot |
+| Health         | Every runtime                | Studio, monitors              | Liveness and measured ages of each loop, node, and link          |
+| Emergency stop | Any authorized peer          | Every runtime                 | Immediate stop; each `SafetyGate` holds or brakes                |
+| Conversation   | `Voice`, Studio, CLI, agents | Agents, `Voice`, Studio       | Ordered turns between people and agents                          |
 
 The emergency stop is an active message and is not the only stop mechanism. If it is
 lost, the stale-command hold still stops every lower tier once the tier above falls
@@ -967,6 +1041,13 @@ Safety is layered. Each layer is enforced independently of the layers above it.
 The `unrestricted` access mode removes permission checks only. Safety gates, leases,
 and deadlines remain in force.
 
+`Voice` is a client with its own identity under the access policy, because anyone near
+the robot can speak to it. A deployment may let voice stop the robot and talk to the
+agent without letting it submit goals directly. Stop phrases cancel running goals
+without involving the reasoning model, so the parts hold within one tick. They are a
+convenience rather than a safety layer, because speech recognition can miss or invent
+words; the emergency stop and `SafetyGate` remain the safety mechanisms.
+
 | Failure              | Response                                                         |
 | -------------------- | ---------------------------------------------------------------- |
 | Client disconnects   | Its lease expires; the skill is cancelled; parts hold            |
@@ -983,7 +1064,7 @@ action source does. It emits an event when a skill starts, is preempted, and end
 recording callback uses these events to produce one episode per skill run. The episode
 contains the loop data in LeRobot format, the goal, the submitting client, the outcome,
 model provenance, intervention segments, the capture time and age of every action, and
-the agent transcript when one exists. Failed and cancelled runs are recorded in the same
+the agent transcript and conversation when they exist. Failed and cancelled runs are recorded in the same
 way as successful ones.
 
 ---
@@ -1088,7 +1169,8 @@ the start, and a configuration may opt out explicitly during the compatibility r
 | 10. Python, YAML, and CLI equivalent    | Every component, link, and budget is a constructor argument                                     |
 | 11. ROS 2 without dependency            | Edge integrations implementing existing protocols ([§14](#14-integrations))                     |
 | 12. Components in other languages       | Bindings to the Python protocols; link schemas with conformance tests ([§14](#14-integrations)) |
-| 13. Gradual migration                   | Staged rename and timing checks in reporting mode ([§15](#15-migration))                        |
+| 13. Speech, chat, and CLI               | One `Conversation` per agent; `Voice` and other interfaces as adapters                          |
+| 14. Gradual migration                   | Staged rename and timing checks in reporting mode ([§15](#15-migration))                        |
 
 ---
 
@@ -1126,6 +1208,8 @@ the start, and a configuration may opt out explicitly during the compatibility r
 | Recording format extensions                         | Data collection at scale                 |
 | Package location of `Agent`                         | System 2 clients                         |
 | World-model interface                               | Imagine-and-rank planning                |
+| Audio device backends                               | `Voice`                                  |
+| Wake words and speaker identification               | Voice in shared spaces                   |
 
 ---
 
@@ -1141,6 +1225,7 @@ the start, and a configuration may opt out explicitly during the compatibility r
 | 6     | `RobotServer` on the `SharedRobot` protocol; robot namespace; presence, health, emergency stop; authentication; timing in handshakes; published link schemas and conformance tests | System 0 and System 1 in separate processes and hosts; budgets checked across them |
 | 7     | KVM partitions; key-level access control; ROS 2 integrations; a native System 0 partition                                                                                          | Humanoid across guests with a C++ System 0; ROS 2 application calls skills         |
 | 8     | Delegated navigation; perceivers; world model                                                                                                                                      | Navigate, pick, and place in one task                                              |
+| 9     | `Conversation`; `Voice`; speech model protocols                                                                                                                                    | A spoken instruction drives a task; a spoken stop cancels it                       |
 
 Phases 1 to 3 deliver value without the later phases. The compatibility path of the
 old `RobotRuntime` constructor is removed one minor release after phase 2.
@@ -1169,6 +1254,7 @@ safety          SafetyGate; leases and deadlines; authenticated links; key-level
 intervention    HIL is preemption by a higher-priority teleoperation skill
 integrations    at the edges, implementing existing protocols; the core depends on none
 languages       any: in-process through bindings to the protocols, or as a partition on the link schemas
+conversation    one ordered stream of turns per agent; voice, chat, and CLI are adapters
 migration       staged rename with one compatibility release
 terminology     robot skill (Skill) is distinct from agent skill (SKILL.md)
 ```
