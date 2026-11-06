@@ -489,7 +489,7 @@ class ControlLoop:
   above, holds when they stop, and rejects setpoints past their deadline.
 - A Python loop runs at System 1 and System 2 rates, up to about 100 Hz
   ([§7](#7-efficiency)). A slow robot, such as a 30 Hz arm, may use a Python loop as
-  its lowest tier.
+  its lowest tier, behind the native `SafetyGate` ([§8](#8-safety-and-recording)).
 - `run()` and `start()` apply the startup checks of
   [§5.8](#58-time-and-freshness) before the first tick.
 
@@ -900,16 +900,23 @@ the tier above falls silent.
 
 ## 7. Efficiency
 
-Python composes the system and runs the slow tiers. Native code runs everything else.
+Python composes the system and runs the slow tiers. A component is native when it runs
+above about 100 Hz, is heavy per call, is safety-critical, or moves large data. Any
+component may be native, through bindings or as a partition ([§9](#9-integrations)).
 
-| Work                                                        | Rate           | Runs in                                                        |
-| ----------------------------------------------------------- | -------------- | -------------------------------------------------------------- |
-| System 0: gate, interpolation, hold, deadlines, arbitration | 200 Hz – 1 kHz | `NativeLoop` (C++) or a vendor controller                      |
-| Model inference                                             | Per model      | OpenVINO, ONNX Runtime, or plugin backends on CPU, GPU, or NPU |
-| Frame decoding and preprocessing                            | Camera rate    | Native transport decoders and the model runtime                |
-| Transport                                                   | Per message    | Zenoh and native codecs                                        |
-| System 1 loops and skills                                   | Up to ~100 Hz  | Python `ControlLoop`; the work inside each tick is native      |
-| System 2: agents, conversation, planning                    | Event-driven   | Python                                                         |
+| Component                                                    | Runs in                                            |
+| ------------------------------------------------------------ | -------------------------------------------------- |
+| System 0 (`NativeLoop`)                                      | Native (required)                                  |
+| Safety gate, stale-command hold, deadlines, watchdog, e-stop | Native (required), bound to Python loops           |
+| Lease enforcement in `RobotServer`                           | Native                                             |
+| Robot drivers, cameras, audio capture                        | Native, usually from vendor SDKs                   |
+| Model inference and preprocessing                            | OpenVINO, ONNX Runtime, or plugin backends         |
+| Transport and codecs                                         | Zenoh and native codecs                            |
+| Perception (detectors, SLAM, depth)                          | Native when heavy: bindings or a partition         |
+| Recording writer (video encoding, files)                     | Native, fed from a queue                           |
+| Action queue, chunk smoothing, `InferenceServer`             | Python or native                                   |
+| System 1 loops, `Skills`, success checks                     | Python, up to ~100 Hz; per-tick work is array work |
+| System 2: agents, conversation, configuration                | Python                                             |
 
 - **Rate ceiling.** The startup check rejects a Python loop above the ceiling, which is
   set per reference platform by benchmark.
@@ -932,18 +939,30 @@ Python composes the system and runs the slow tiers. Native code runs everything 
 
 Each safety layer is enforced independently of the layers above it.
 
-| Layer               | Component                               | Enforces                                                      |
-| ------------------- | --------------------------------------- | ------------------------------------------------------------- |
-| Hardware / firmware | Robot                                   | Power, torque, and temperature limits                         |
-| Safety gate         | `NativeLoop`, or `SafetyGate` in Python | Joint, velocity, workspace, and force limits on every command |
-| Stale-command hold  | Lower loop                              | Hold or stop when the tier above goes silent                  |
-| Freshness           | Every consumer                          | Hold on stale inputs; reject setpoints past their deadline    |
-| Startup checks      | `ControlLoop`, `RobotRuntime`           | No start when ages, budgets, or rates cannot be met           |
-| Leases              | `Skills`, `RobotServer`                 | One writer per part                                           |
-| Access policy       | `Skills`                                | Which clients may run which skills                            |
-| Link authentication | Robot command and skills links          | Only authenticated peers send setpoints or submit goals       |
-| Partition boundary  | Key-level access control                | System 2 cannot reach the robot command keys                  |
-| Emergency stop      | Robot namespace                         | Reaches every runtime of the robot                            |
+| Layer               | Component                        | Enforces                                                          |
+| ------------------- | -------------------------------- | ----------------------------------------------------------------- |
+| Hardware / firmware | Robot                            | Power, torque, and temperature limits; stop when the process dies |
+| Safety gate         | Native `SafetyGate`              | Joint, velocity, workspace, and force limits on every command     |
+| Watchdog            | Native thread of the safety gate | Hold when setpoints stop, even if the Python process stalls       |
+| Stale-command hold  | Lower loop                       | Hold or stop when the tier above goes silent                      |
+| Freshness           | Every consumer                   | Hold on stale inputs; reject setpoints past their deadline        |
+| Startup checks      | `ControlLoop`, `RobotRuntime`    | No start when ages, budgets, or rates cannot be met               |
+| Leases              | `Skills`, `RobotServer`          | One writer per part                                               |
+| Access policy       | `Skills`                         | Which clients may run which skills                                |
+| Link authentication | Robot command and skills links   | Only authenticated peers send setpoints or submit goals           |
+| Partition boundary  | Key-level access control         | System 2 cannot reach the robot command keys                      |
+| Emergency stop      | Native listener in every runtime | Reaches every runtime of the robot                                |
+
+Every safety mechanism is native, whatever the loop rate. A Python loop driving a 30 Hz
+arm uses the same native `SafetyGate` through bindings, so one implementation is
+verified everywhere. The gate's native thread needs no interpreter lock, so it holds
+the robot when a Python loop stalls on garbage collection, the lock, or a deadlock. If
+the whole process dies, the robot's firmware or hardware stop must act.
+
+```python
+ControlLoop(robot=SafetyGate(SO101(port="/dev/ttyACM0"), limits=SO101_LIMITS),
+            action_source=skills, fps=30)           # native gate and watchdog
+```
 
 The `unrestricted` access mode removes permission checks only; gates, leases, and
 deadlines remain. `Voice` is a client with its own identity, because anyone nearby can
@@ -957,6 +976,8 @@ recognition can miss or invent words.
 | Remote model is late | The source holds and reports starvation; the goal may fail     |
 | System 1 goes silent | System 0 applies its stale-command hold                        |
 | System 0 faults      | System 1 stops; running goals fail                             |
+| Python loop stalls   | The native watchdog holds the robot                            |
+| Process crashes      | Firmware or hardware stop                                      |
 | Link lost            | Treated as silence; a new lease is required after reconnection |
 | A check fails        | The runtime does not start and reports the input or path       |
 
@@ -1065,38 +1086,38 @@ Studio and the documentation move to `ControlLoop` in stage 1.
 
 **Deferred decisions**
 
-| Topic                                        | Needed by                        |
-| -------------------------------------------- | -------------------------------- |
-| Command modes and payloads                   | Part-keyed actions               |
-| Link schemas and conformance tests           | Multi-partition and native peers |
-| Packaging and ABI of the native library      | `NativeLoop`, vendor partitions  |
-| Benchmark targets per reference platform     | Performance gates                |
-| Key layout of the robot namespace            | Multi-partition deployment       |
-| Authentication and access-control mechanism  | Cross-host deployment            |
-| Lease durations, priorities, access policies | `Skills` with several clients    |
-| Clock-offset bounds and default `max_age`    | Startup checks                   |
-| Timing of vendor and ROS 2 controllers       | Integrations                     |
-| Shared memory between KVM guests             | Guest-to-guest bandwidth         |
-| Deployment file for `physicalai up`          | Launching several partitions     |
-| Recording format extensions                  | Data collection at scale         |
-| Audio backends, wake words, speaker identity | `Voice`                          |
-| World-model interface                        | Imagine-and-rank planning        |
+| Topic                                                            | Needed by                        |
+| ---------------------------------------------------------------- | -------------------------------- |
+| Command modes and payloads                                       | Part-keyed actions               |
+| Link schemas and conformance tests                               | Multi-partition and native peers |
+| Language (C++ or Rust), packaging, and ABI of the native library | `NativeLoop`, vendor partitions  |
+| Benchmark targets per reference platform                         | Performance gates                |
+| Key layout of the robot namespace                                | Multi-partition deployment       |
+| Authentication and access-control mechanism                      | Cross-host deployment            |
+| Lease durations, priorities, access policies                     | `Skills` with several clients    |
+| Clock-offset bounds and default `max_age`                        | Startup checks                   |
+| Timing of vendor and ROS 2 controllers                           | Integrations                     |
+| Shared memory between KVM guests                                 | Guest-to-guest bandwidth         |
+| Deployment file for `physicalai up`                              | Launching several partitions     |
+| Recording format extensions                                      | Data collection at scale         |
+| Audio backends, wake words, speaker identity                     | `Voice`                          |
+| World-model interface                                            | Imagine-and-rank planning        |
 
 ---
 
 ## 12. Implementation Phases
 
-| Phase | Scope                                                                                  | Exit criterion                                                       |
-| ----- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| 1     | `ControlLoop` alias; part-keyed actions; `start()`; capture times; benchmarks in CI    | Existing tests, configurations, and Studio pass; baselines recorded  |
-| 2     | `NativeLoop`; a loop as another loop's robot; partition `RobotRuntime`; startup checks | Native 500 Hz System 0 under a Python System 1; predicted ages hold  |
-| 3     | `Skills`, `Goal`, `PolicySkill`, `TeleopSkill`, leases, skill events                   | Tabletop task from Python and YAML; HIL takeover recorded            |
-| 4     | `ModelSpec`; remote and isolated-environment models in skills                          | Identical actions in-process and served                              |
-| 5     | `SkillsServer`, `SkillsClient`, `McpServer`, `Agent`                                   | Cloud agent and MCP host drive the same robot                        |
-| 6     | `RobotServer`; robot namespace; health; emergency stop; authentication; link schemas   | System 0 and System 1 on separate hosts; budgets checked across them |
-| 7     | KVM partitions; key-level access control; ROS 2; a native System 0 partition           | Humanoid across guests with a C++ System 0; ROS 2 calls skills       |
-| 8     | Delegated navigation; perceivers; world model                                          | Navigate, pick, and place in one task                                |
-| 9     | `Conversation`, `Voice`, speech models                                                 | A spoken instruction drives a task; a spoken stop cancels it         |
+| Phase | Scope                                                                                                                    | Exit criterion                                                       |
+| ----- | ------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| 1     | `ControlLoop` alias; part-keyed actions; `start()`; capture times; benchmarks in CI                                      | Existing tests, configurations, and Studio pass; baselines recorded  |
+| 2     | `NativeLoop`; native `SafetyGate` and watchdog; a loop as another loop's robot; partition `RobotRuntime`; startup checks | Native 500 Hz System 0 under a Python System 1; predicted ages hold  |
+| 3     | `Skills`, `Goal`, `PolicySkill`, `TeleopSkill`, leases, skill events                                                     | Tabletop task from Python and YAML; HIL takeover recorded            |
+| 4     | `ModelSpec`; remote and isolated-environment models in skills                                                            | Identical actions in-process and served                              |
+| 5     | `SkillsServer`, `SkillsClient`, `McpServer`, `Agent`                                                                     | Cloud agent and MCP host drive the same robot                        |
+| 6     | `RobotServer`; robot namespace; health; emergency stop; authentication; link schemas                                     | System 0 and System 1 on separate hosts; budgets checked across them |
+| 7     | KVM partitions; key-level access control; ROS 2; a native System 0 partition                                             | Humanoid across guests with a C++ System 0; ROS 2 calls skills       |
+| 8     | Delegated navigation; perceivers; world model                                                                            | Navigate, pick, and place in one task                                |
+| 9     | `Conversation`, `Voice`, speech models                                                                                   | A spoken instruction drives a task; a spoken stop cancels it         |
 
 Phases 1 to 3 deliver value without the later phases.
 
@@ -1119,7 +1140,8 @@ conversation    one ordered stream of turns; voice, chat, and CLI are adapters
 models          owned by the components that use them; in-process or served by name
 time            every value carries capture time; the timing graph is derived and checked
 efficiency      Python composes, native code computes; planned ticks; no copies
-safety          gate, hold, freshness, leases, access policy, authenticated links, e-stop
+safety          native gate, hold, watchdog, and e-stop; leases; access policy; authenticated links
+native          any component; required for System 0 and safety, preferred for heavy or data-bound work
 integrations    at the edges; ROS 2 and other languages implement the same protocols
 migration       staged rename with one compatibility release
 ```
